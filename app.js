@@ -20,7 +20,7 @@ const DEFAULT_CATS = [
   ['Abbonamenti digitali','📺','fissa'],['Trasporti','🚗','entrambe'],['Finanziamenti e Rate','🏦','fissa'],
   ['Salute','🩺','entrambe'],['Assicurazioni','🛡️','fissa'],
   ['Spesa alimentare','🛒','extra'],['Ristoranti e bar','🍽️','extra'],['Svago','🎟️','extra'],
-  ['Abbigliamento','👕','extra'],['Regali','🎁','extra'],['Cura personale','🧴','extra'],['Altro','📦','entrambe']
+  ['Abbigliamento','👕','extra'],['Regali','🎁','extra'],['Cura personale','🧴','extra'],['Altro','📦','entrambe'],['Carburante','⛽','entrambe']
 ];
 
 // ───────────────────────── Utilità ─────────────────────────
@@ -49,13 +49,19 @@ function fresh() {
     v: 1,
     categorie: DEFAULT_CATS.map((c, i) => ({id:'c'+(i+1), nome:c[0], icona:c[1], uso:c[2], colore:PALETTE[i % PALETTE.length]})),
     previste: [], movimenti: [], entrate: [],
-    imp: {budgetExtra:0, preavviso:5, ultimaCat:'c10'}
+    imp: {budgetExtra:0, preavviso:5, ultimaCat:'c10', mig11:true}
   };
 }
 function normalize(s) {
   const f = fresh();
   const out = Object.assign(f, s || {});
-  out.imp = Object.assign(fresh().imp, (s && s.imp) || {});
+  out.imp = Object.assign(fresh().imp, {mig11:false}, (s && s.imp) || {});
+  // v1.1: categoria Carburante per chi aveva già dei dati
+  if (!out.imp.mig11) {
+    if (Array.isArray(out.categorie) && !out.categorie.some(c => (c.nome || '').toLowerCase() === 'carburante'))
+      out.categorie.push({id: 'c' + uid(), nome: 'Carburante', icona: '⛽', uso: 'entrambe', colore: '#c4623f'});
+    out.imp.mig11 = true;
+  }
   ['categorie','previste','movimenti','entrate'].forEach(k => { if (!Array.isArray(out[k])) out[k] = k === 'categorie' ? fresh().categorie : []; });
   return out;
 }
@@ -112,6 +118,50 @@ function confermeOrfane(y, m, occ) {
   const k = ymKey(y, m), ids = new Set(occ.map(o => o.mov && o.mov.id));
   return S.movimenti.filter(x => x.tipo === 'prevista' && x.periodo === k && !ids.has(x.id));
 }
+// Budget per categoria: conta extra + previste confermate del mese
+function spesoCategoria(cid, y, m) {
+  const k = ymKey(y, m);
+  const speso = sum(S.movimenti.filter(x => x.categoriaId === cid && (x.tipo === 'extra' ? (x.data || '').startsWith(k) : x.periodo === k)), x => x.importo);
+  const daConf = sum(occorrenze(y, m).filter(o => !o.mov && o.p.categoriaId === cid), o => o.p.importo);
+  return {speso, daConf};
+}
+function mediaCategoria(cid, mesi) {
+  const t = today(); let tot = 0;
+  for (let i = 1; i <= mesi; i++) { const x = addMonths(t.y, t.m, -i); tot += spesoCategoria(cid, x.y, x.m).speso; }
+  return tot / mesi;
+}
+// Conferma automatica degli addebiti: crea la conferma quando la scadenza è passata
+function autoConferma() {
+  const t = today(), iso = isoToday(), kNow = ymKey(t.y, t.m), nomi = [];
+  S.previste.forEach(p => {
+    if (!p.autoConferma || p.attiva === false || p.metodo !== 'addebito') return;
+    let y = t.y, m = t.m;
+    if (/^\d{4}-\d{2}$/.test(p.autoDal || '')) { y = +p.autoDal.slice(0, 4); m = +p.autoDal.slice(5, 7); }
+    for (let guard = 0; ymKey(y, m) <= kNow && guard < 36; guard++) {
+      const k = ymKey(y, m);
+      if (dovuta(p, y, m) && !(p.autoSkip || []).includes(k)) {
+        const scad = `${k}-${pad(p.giorno ? Math.min(+p.giorno, dim(y, m)) : dim(y, m))}`;
+        if (scad <= iso && !S.movimenti.some(x => x.tipo === 'prevista' && x.previstaId === p.id && x.periodo === k)) {
+          S.movimenti.push({id: uid(), tipo: 'prevista', previstaId: p.id, periodo: k, data: scad, importo: p.importo, categoriaId: p.categoriaId, descrizione: p.voce, metodo: p.metodo, note: '', auto: true});
+          nomi.push(p.voce);
+        }
+      }
+      ({y, m} = addMonths(y, m, 1));
+    }
+  });
+  if (nomi.length) {
+    save();
+    toast(nomi.length === 1 ? `⚡ ${nomi[0]} confermata in automatico` : `⚡ ${nomi.length} addebiti confermati in automatico`);
+  }
+  return nomi.length;
+}
+function avvisoBudget(cid, ym) {
+  const c = cat(cid), b = +c.budget || 0; if (!b || !ym) return null;
+  const {speso} = spesoCategoria(cid, +ym.slice(0, 4), +ym.slice(5, 7)), pct = speso / b * 100;
+  if (pct >= 100) return `⚠️ ${c.nome}: budget superato di ${fmt(speso - b)}`;
+  if (pct >= 80) return `${c.nome}: hai usato il ${Math.round(pct)}% del budget`;
+  return null;
+}
 const extraMese = k => S.movimenti.filter(x => x.tipo === 'extra' && (x.data || '').startsWith(k));
 const entrateMese = m => sum(S.entrate.filter(e => !+e.mese || +e.mese === m), e => e.importo);
 
@@ -163,13 +213,14 @@ function statoOcc(o) {
   if (dd <= (+S.imp.preavviso || 0)) return {cls:'warn', txt:`Tra ${dd} g · ${fmtData(o.scad)}`};
   return {cls:'', txt:'Scade il ' + fmtData(o.scad)};
 }
+const isAuto = p => !!p.autoConferma && p.metodo === 'addebito';
 function rowDaConfermare(o) {
   const p = o.p, c = cat(p.categoriaId), st = statoOcc(o);
   return `<div class="row">
     ${catIc(c)}
     <div class="row-main" data-a="conferma" data-id="${p.id}|${o.periodo}">
       <div class="row-t">${h(p.voce)}</div>
-      <div class="row-s"><span class="pill ${st.cls}">${st.txt}</span><span>${METODI[p.metodo] || ''}${nAnno(p) < 12 ? ' · ' + FREQ[p.frequenza].l.toLowerCase() : ''}${p.tipo === 'variabile' ? ' · stima' : ''}</span></div>
+      <div class="row-s"><span class="pill ${st.cls}">${st.txt}</span><span>${METODI[p.metodo] || ''}${nAnno(p) < 12 ? ' · ' + FREQ[p.frequenza].l.toLowerCase() : ''}${p.tipo === 'variabile' ? ' · stima' : ''}</span>${isAuto(p) ? '<span class="pill ok">⚡ automatica</span>' : ''}</div>
     </div>
     <div class="row-r"><div class="amt">${fmt(p.importo)}</div><button class="btn sm" data-a="conferma" data-id="${p.id}|${o.periodo}">Conferma</button></div>
   </div>`;
@@ -179,7 +230,7 @@ function rowConfermata(o) {
   return `<div class="row tap" data-a="conferma" data-id="${p.id}|${o.periodo}">
     <span class="check">✓</span>
     <div class="row-main"><div class="row-t">${h(p.voce)}</div>
-      <div class="row-s"><span>Pagata il ${fmtData(mv.data)} · ${METODI[mv.metodo] || ''}</span>${diff ? `<span class="pill ${diff > 0 ? 'danger' : 'ok'}">${diff > 0 ? '+' : ''}${fmt(diff)} sul previsto</span>` : ''}</div></div>
+      <div class="row-s"><span>Pagata il ${fmtData(mv.data)} · ${METODI[mv.metodo] || ''}</span>${mv.auto ? '<span class="pill ok">⚡ automatica</span>' : ''}${diff ? `<span class="pill ${diff > 0 ? 'danger' : 'ok'}">${diff > 0 ? '+' : ''}${fmt(diff)} sul previsto</span>` : ''}</div></div>
     <div class="amt">${fmt(mv.importo)}</div>
   </div>`;
 }
@@ -191,6 +242,25 @@ function rowMov(x) {
       <div class="row-s"><span>${fmtData(x.data)} · ${h(c.nome)}${x.metodo ? ' · ' + METODI[x.metodo] : ''}</span></div></div>
     <div class="amt">${fmt(x.importo)}</div>
   </div>`;
+}
+
+function budgetCategorie(y, m, conTitolo) {
+  const cats = S.categorie.filter(c => +c.budget > 0);
+  if (!cats.length) return '';
+  const rows = cats.map(c => ({c, b: +c.budget, ...spesoCategoria(c.id, y, m)})).sort((a, b) => b.speso / b.b - a.speso / a.b);
+  return `<section>
+    <div class="sec-h"><h2>Budget per categoria</h2><button class="link" data-a="budgets">Modifica</button></div>
+    <div class="card bud-list">${rows.map(r => {
+      const pct = r.speso / r.b * 100, over = r.speso > r.b, rest = r.b - r.speso;
+      const col = over ? 'var(--danger)' : pct >= 80 ? 'var(--warn)' : r.c.colore;
+      const sfora = !over && r.daConf > 0 && r.speso + r.daConf > r.b;
+      return `<div class="bud">
+        <div class="kv"><span>${h(r.c.icona)} ${h(r.c.nome)}</span><b class="small${over ? ' neg' : ''}">${fmt(r.speso)} <span class="muted" style="font-weight:500">/ ${fmt(r.b)}</span></b></div>
+        <div style="margin:7px 0 5px">${bar(pct, col)}</div>
+        <div class="row-s">${over ? `<span class="pill danger">Superato di ${fmt(-rest)}</span>` : `<span class="pill${pct >= 80 ? ' warn' : ''}">Restano ${fmt(rest)}</span>`}${r.daConf ? `<span>${fmt(r.daConf)} di spese previste ancora da pagare</span>` : ''}${sfora ? '<span class="pill warn">Con le previste sforerai</span>' : ''}</div>
+      </div>`;
+    }).join('')}</div>
+  </section>`;
 }
 
 // ───────────────────────── Vista: Mese ─────────────────────────
@@ -217,6 +287,8 @@ function vMese() {
     <div style="margin-top:10px">${bar(d.totEx / b * 100, null, d.totEx > b)}</div>
     <div class="hint" style="margin-top:8px">${d.totEx > b ? `Hai superato il budget di <b>${fmt(d.totEx - b)}</b>.` : `Puoi ancora spendere <b>${fmt(b - d.totEx)}</b> in extra questo mese.`}</div>
   </section>` : ''}
+
+  ${budgetCategorie(cur.y, cur.m)}
 
   ${prossimeNonMensili.length ? `<div class="tip warn"><span class="em">📌</span><div>Questo mese ci sono <b>${prossimeNonMensili.length}</b> spese non mensili da pagare (${prossimeNonMensili.map(o => h(o.p.voce)).join(', ')}) per <b>${fmt(sum(prossimeNonMensili, o => o.p.importo))}</b>.</div></div>` : ''}
 
@@ -277,7 +349,7 @@ function vPreviste() {
       <tbody>${list.map(p => { const c = cat(p.categoriaId); return `<tr data-a="editPrev" data-id="${p.id}" class="${p.attiva === false ? 'off' : ''}">
         <td><b>${h(p.voce)}</b></td><td>${h(c.icona)} ${h(c.nome)}</td><td>${TIPI[p.tipo] || ''}</td><td>${FREQ[p.frequenza].l}</td>
         <td class="n">${fmt(p.importo)}</td><td class="n">${fmt(mensileEq(p))}</td><td class="n">${fmt(annuo(p))}</td>
-        <td>${h(scadenzaTesto(p))}</td><td>${METODI[p.metodo] || ''}</td><td><span class="prio prio-${p.priorita}">${PRIO[p.priorita] || ''}</span></td></tr>`; }).join('')}</tbody>
+        <td>${h(scadenzaTesto(p))}</td><td>${METODI[p.metodo] || ''}${isAuto(p) ? ' ⚡' : ''}</td><td><span class="prio prio-${p.priorita}">${PRIO[p.priorita] || ''}</span></td></tr>`; }).join('')}</tbody>
       <tfoot><tr><td colspan="5">Totale${filtrato ? ' (filtro)' : ''} · solo attive</td><td class="n">${fmt(sum(lAtt, mensileEq))}</td><td class="n">${fmt(sum(lAtt, annuo))}</td><td colspan="3"></td></tr></tfoot>
     </table></div>`
     : `<div style="display:flex;flex-direction:column;gap:10px">${list.map(cardPrev).join('') || '<div class="card empty-s">Nessuna voce con questi filtri.</div>'}</div>`;
@@ -302,7 +374,7 @@ function cardPrev(p) {
       <div><span>Mensile equiv.</span><b>${fmt(mensileEq(p))}</b></div>
       <div><span>Annuo</span><b>${fmt(annuo(p))}</b></div>
     </div>
-    <div class="row-s">📅 ${h(scadenzaTesto(p))} · ${METODI[p.metodo] || ''}${p.fine ? ' · fino a ' + fmtYM(p.fine) : ''}${p.inizio ? ' · da ' + fmtYM(p.inizio) : ''}</div>
+    <div class="row-s">📅 ${h(scadenzaTesto(p))} · ${METODI[p.metodo] || ''}${isAuto(p) ? ' · ⚡ conferma automatica' : ''}${p.fine ? ' · fino a ' + fmtYM(p.fine) : ''}${p.inizio ? ' · da ' + fmtYM(p.inizio) : ''}</div>
   </div>`;
 }
 
@@ -414,6 +486,8 @@ function vReport() {
     </div>
   </section>
 
+  ${budgetCategorie(cur.y, cur.m)}
+
   <section>
     <div class="sec-h"><h2>Bilancio del mese</h2></div>
     <div class="card">
@@ -459,8 +533,23 @@ function vAltro() {
   </section>
 
   <section>
+    <div class="sec-h"><h2>Budget per categoria</h2><button class="link" data-a="budgets">Imposta</button></div>
+    <div class="list">${S.categorie.filter(c => +c.budget > 0).map(c => `<div class="set-row tap" data-a="budgets">${catIc(c, 1)}<div class="row-main"><div class="row-t">${h(c.nome)}</div></div><b>${fmt(c.budget)}/mese</b></div>`).join('')
+      || '<div class="empty-s">Nessun budget impostato. <button class="link" data-a="budgets">Imposta i budget →</button></div>'}</div>
+  </section>
+
+  <section>
+    <div class="sec-h"><h2>⚡ Conferma automatica addebiti</h2></div>
+    ${(() => { const add = S.previste.filter(p => p.metodo === 'addebito' && p.attiva !== false).sort((a, b) => a.voce.localeCompare(b.voce));
+      return add.length ? `<div class="hint">Gli addebiti attivati qui vengono confermati da soli il giorno della scadenza. Le bollette variabili vengono confermate con l'importo previsto: potrai correggerlo in seguito.</div>
+      <div class="btn-row"><button class="btn ghost sm" data-a="autoAll" data-id="1">Attiva tutti</button><button class="btn ghost sm" data-a="autoAll" data-id="0">Disattiva tutti</button></div>
+      <div class="list">${add.map(p => `<label class="set-row" style="cursor:pointer">${catIc(cat(p.categoriaId), 1)}<div class="row-main"><div class="row-t">${h(p.voce)}</div><div class="row-s">${fmt(p.importo)} · ${h(scadenzaTesto(p))}${p.tipo === 'variabile' ? ' · variabile' : ''}</div></div><input type="checkbox" class="tgl" data-ch="auto" data-id="${p.id}"${p.autoConferma ? ' checked' : ''}></label>`).join('')}</div>`
+      : '<div class="list"><div class="empty-s">Nessuna spesa prevista con metodo "Addebito".</div></div>'; })()}
+  </section>
+
+  <section>
     <div class="sec-h"><h2>Categorie</h2><button class="link" data-a="addCat">+ Aggiungi</button></div>
-    <div class="list">${S.categorie.map(c => `<div class="row tap" data-a="editCat" data-id="${c.id}">${catIc(c, 1)}<div class="row-main"><div class="row-t">${h(c.nome)}</div><div class="row-s">${c.uso === 'fissa' ? 'Spese previste' : c.uso === 'extra' ? 'Spese extra' : 'Previste ed extra'}</div></div><span class="muted">›</span></div>`).join('')}</div>
+    <div class="list">${S.categorie.map(c => `<div class="row tap" data-a="editCat" data-id="${c.id}">${catIc(c, 1)}<div class="row-main"><div class="row-t">${h(c.nome)}</div><div class="row-s">${c.uso === 'fissa' ? 'Spese previste' : c.uso === 'extra' ? 'Spese extra' : 'Previste ed extra'}${+c.budget > 0 ? ' · budget ' + fmt(c.budget) : ''}</div></div><span class="muted">›</span></div>`).join('')}</div>
   </section>
 
   <section>
@@ -478,7 +567,7 @@ function vAltro() {
       <div class="set-row tap" data-a="seed"><div><div class="row-t">Carica dati di esempio</div><div class="row-s">Sostituisce i dati attuali</div></div><span class="muted">›</span></div>
       <div class="set-row tap" data-a="reset"><div><div class="row-t" style="color:var(--danger)">Cancella tutti i dati</div><div class="row-s">Operazione non reversibile</div></div><span class="muted">›</span></div>
     </div>
-    <div class="hint" style="text-align:center">Spese di Casa · v1.0 · ${S.previste.length} previste · ${S.movimenti.length} movimenti</div>
+    <div class="hint" style="text-align:center">Spese di Casa · v1.1 · ${S.previste.length} previste · ${S.movimenti.length} movimenti</div>
   </section>`;
 }
 
@@ -547,6 +636,7 @@ function formPrevista(id) {
     </div>
     <div class="hint" style="margin-top:-6px">Utile per rate e finanziamenti: dopo l'ultima rata la voce smette di comparire.</div>
     <div class="field"><label for="fp-note">Note</label><input type="text" id="fp-note" name="note" value="${h(p.note || '')}" placeholder="es. codice cliente, IBAN…"></div>
+    <label class="switch" id="fp-auto-w"><span>⚡ Conferma automatica alla scadenza<br><small class="muted" id="fp-auto-h">Il giorno della scadenza l'addebito viene confermato da solo.</small></span><input type="checkbox" name="autoConferma"${p.autoConferma ? ' checked' : ''}></label>
     <label class="switch"><span>Voce attiva</span><input type="checkbox" name="attiva"${p.attiva !== false ? ' checked' : ''}></label>
     <div class="form-actions">${nuovo ? '' : '<button type="button" class="btn danger" id="fp-del">Elimina</button>'}<button class="btn" type="submit">Salva</button></div>
   </form>`, el => {
@@ -563,6 +653,11 @@ function formPrevista(id) {
       $('#fp-mesi-txt', el).textContent = freq.value === 'mensile' ? '' : 'Pagamenti in: ' + mesiDovuti(tmp).map(m => MESI_B[m - 1]).join(', ');
       $('#fp-me', el).textContent = tmp.importo ? fmt(mensileEq(tmp)) : '—';
       $('#fp-an', el).textContent = tmp.importo ? fmt(annuo(tmp)) : '—';
+      const met = (f.querySelector('[name=metodo]:checked') || {}).value;
+      $('#fp-auto-w', el).style.display = met === 'addebito' ? '' : 'none';
+      $('#fp-auto-h', el).textContent = tipo.value === 'variabile'
+        ? "Viene confermato con l'importo previsto: potrai correggerlo quando arriva la bolletta."
+        : "Il giorno della scadenza l'addebito viene confermato da solo.";
     };
     f.addEventListener('input', sync); f.addEventListener('change', sync); sync();
     if (nuovo) setTimeout(() => f.voce.focus(), 250);
@@ -580,9 +675,11 @@ function formPrevista(id) {
         priorita: (f.querySelector('[name=priorita]:checked') || {}).value || 'essenziale',
         inizio: f.inizio.value || '', fine: f.fine.value || '', note: f.note.value.trim(), attiva: f.attiva.checked
       };
+      data.autoConferma = data.metodo === 'addebito' && f.autoConferma.checked;
+      if (data.autoConferma && !p.autoConferma) { const t = today(); data.autoDal = ymKey(t.y, t.m); data.autoSkip = []; }
       if (nuovo) S.previste.push(Object.assign({id: uid()}, data));
       else Object.assign(S.previste.find(x => x.id === id), data);
-      save(); closeSheet(); render(); toast(nuovo ? 'Spesa prevista aggiunta' : 'Modifiche salvate');
+      save(); closeSheet(); const na = autoConferma(); render(); if (!na) toast(nuovo ? 'Spesa prevista aggiunta' : 'Modifiche salvate');
     };
     const del = $('#fp-del', el);
     if (del) del.onclick = () => {
@@ -622,12 +719,16 @@ function formConferma(pid, periodo) {
       const imp = num(f.importo.value);
       if (imp <= 0) return toast('Inserisci un importo valido');
       const data = {importo: imp, data: f.data.value || isoToday(), metodo: f.metodo.value, note: f.note.value.trim(), categoriaId: p.categoriaId, descrizione: p.voce};
-      if (mov) Object.assign(mov, data);
+      if (mov) { Object.assign(mov, data); mov.auto = false; }
       else S.movimenti.push(Object.assign({id: uid(), tipo: 'prevista', previstaId: pid, periodo}, data));
-      save(); closeSheet(); render(); toast(mov ? 'Modifiche salvate' : `${p.voce} confermata ✓`);
+      save(); closeSheet(); render(); toast(avvisoBudget(p.categoriaId, periodo) || (mov ? 'Modifiche salvate' : `${p.voce} confermata ✓`));
     };
     const u = $('#fc-undo', el);
-    if (u) u.onclick = () => { S.movimenti = S.movimenti.filter(x => x !== mov); save(); closeSheet(); render(); toast('Conferma annullata'); };
+    if (u) u.onclick = () => {
+      S.movimenti = S.movimenti.filter(x => x !== mov);
+      if (p.autoConferma) { p.autoSkip = (p.autoSkip || []).concat(periodo); }
+      save(); closeSheet(); render(); toast(p.autoConferma ? 'Conferma annullata: per questo mese non verrà riconfermata in automatico' : 'Conferma annullata');
+    };
     $('#fc-edit', el).onclick = () => formPrevista(pid);
   });
 }
@@ -677,7 +778,7 @@ function mountExtra(el, x) {
     if (x) Object.assign(x, data);
     else S.movimenti.push(Object.assign({id: uid(), tipo: 'extra', note: ''}, data));
     S.imp.ultimaCat = c;
-    save(); closeSheet(); render(); toast(x ? 'Modifiche salvate' : 'Spesa aggiunta');
+    save(); closeSheet(); render(); toast(avvisoBudget(c, data.data.slice(0, 7)) || (x ? 'Modifiche salvate' : 'Spesa aggiunta'));
   };
   const d = $('#fx-del', el);
   if (d) d.onclick = () => askConfirm('Eliminare questa spesa?', 'Elimina', () => { S.movimenti = S.movimenti.filter(m => m !== x); save(); render(); toast('Spesa eliminata'); }, true);
@@ -755,6 +856,7 @@ function formCategoria(id) {
       <div class="field"><label for="fk-i">Icona (emoji)</label><input type="text" id="fk-i" name="icona" value="${h(c.icona)}" maxlength="4"></div>
       <div class="field"><label for="fk-c">Colore</label><input type="color" id="fk-c" name="colore" value="${h(c.colore)}"></div>
     </div>
+    <div class="field"><label for="fk-b">Budget mensile <span style="text-transform:none;font-weight:500">(opz.)</span></label><input type="text" inputmode="decimal" id="fk-b" name="budget" value="${numIn(c.budget || '')}" placeholder="nessun budget"><small>Conta tutte le spese del mese in questa categoria: extra e previste confermate.</small></div>
     <div class="field"><label for="fk-u">Usata per</label><select id="fk-u" name="uso">${optList({fissa: 'Spese previste', extra: 'Spese extra', entrambe: 'Previste ed extra'}, c.uso)}</select></div>
     <div class="form-actions">${id ? `<button type="button" class="btn danger" id="fk-del"${usata ? ' disabled title="Categoria in uso"' : ''}>Elimina</button>` : ''}<button class="btn" type="submit">Salva</button></div>
     ${usata ? '<div class="hint">La categoria è usata da alcune voci: non può essere eliminata, ma puoi rinominarla.</div>' : ''}
@@ -763,12 +865,24 @@ function formCategoria(id) {
     f.onsubmit = ev => {
       ev.preventDefault();
       if (!f.nome.value.trim()) return toast('Inserisci un nome');
-      const data = {nome: f.nome.value.trim(), icona: f.icona.value.trim() || '📦', colore: f.colore.value, uso: f.uso.value};
+      const data = {nome: f.nome.value.trim(), icona: f.icona.value.trim() || '📦', colore: f.colore.value, uso: f.uso.value, budget: num(f.budget.value) || 0};
       if (id) Object.assign(S.categorie.find(x => x.id === id), data); else S.categorie.push(Object.assign({id: 'c' + uid()}, data));
       save(); closeSheet(); render(); toast('Categoria salvata');
     };
     const d = $('#fk-del', el);
     if (d && !usata) d.onclick = () => { S.categorie = S.categorie.filter(x => x.id !== id); save(); closeSheet(); render(); toast('Categoria eliminata'); };
+  });
+}
+
+function formBudgets() {
+  const cats = S.categorie.slice().sort((a, b) => (+b.budget > 0) - (+a.budget > 0) || (a.uso === 'fissa') - (b.uso === 'fissa'));
+  openSheet('Budget per categoria', `<form id="fb" autocomplete="off">
+    <div class="hint">Imposta un tetto mensile solo per le categorie che vuoi tenere d'occhio, per esempio spesa alimentare e carburante. Conta sia le spese extra sia le previste confermate. Lascia vuoto per nessun budget.</div>
+    <div class="list">${cats.map(c => { const md = mediaCategoria(c.id, 3); return `<div class="set-row">${catIc(c, 1)}<div class="row-main" style="cursor:default"><div class="row-t">${h(c.nome)}</div><div class="row-s">${md ? 'Media ultimi 3 mesi: ' + fmt(md) : 'Nessuna spesa negli ultimi 3 mesi'}</div></div><input type="text" inputmode="decimal" name="b_${c.id}" value="${numIn(c.budget || '')}" placeholder="—" aria-label="Budget ${h(c.nome)}"></div>`; }).join('')}</div>
+    <div class="form-actions"><button class="btn" type="submit">Salva</button></div>
+  </form>`, el => {
+    const f = $('#fb', el);
+    f.onsubmit = e => { e.preventDefault(); S.categorie.forEach(c => { const i = f.elements['b_' + c.id]; if (i) c.budget = num(i.value) || 0; }); save(); closeSheet(); render(); toast('Budget salvati'); };
   });
 }
 
@@ -806,8 +920,8 @@ const actionsExport = {
     offerFile(`spese-${k}.csv`, csvMovimenti(S.movimenti.filter(x => x.tipo === 'extra' ? x.data.startsWith(k) : x.periodo === k)), 'text/csv');
   },
   exportPrev: () => offerFile(`spese-previste-${isoToday()}.csv`, toCsv([
-    ['Voce', 'Categoria', 'Tipo', 'Frequenza', 'Importo per pagamento', 'Costo mensile equivalente', 'Costo annuo', 'Scadenza', 'Metodo', 'Priorità', 'Attiva', 'Dal', 'Fino al', 'Note'],
-    ...S.previste.map(p => [p.voce, cat(p.categoriaId).nome, TIPI[p.tipo], FREQ[p.frequenza].l, csvNum(p.importo), csvNum(mensileEq(p)), csvNum(annuo(p)), scadenzaTesto(p), METODI[p.metodo], PRIO[p.priorita], p.attiva === false ? 'No' : 'Sì', p.inizio || '', p.fine || '', p.note || ''])
+    ['Voce', 'Categoria', 'Tipo', 'Frequenza', 'Importo per pagamento', 'Costo mensile equivalente', 'Costo annuo', 'Scadenza', 'Metodo', 'Priorità', 'Conferma automatica', 'Attiva', 'Dal', 'Fino al', 'Note'],
+    ...S.previste.map(p => [p.voce, cat(p.categoriaId).nome, TIPI[p.tipo], FREQ[p.frequenza].l, csvNum(p.importo), csvNum(mensileEq(p)), csvNum(annuo(p)), scadenzaTesto(p), METODI[p.metodo], PRIO[p.priorita], isAuto(p) ? 'Sì' : 'No', p.attiva === false ? 'No' : 'Sì', p.inizio || '', p.fine || '', p.note || ''])
   ]), 'text/csv'),
   importJson: () => { const i = $('#import-file'); i.value = ''; i.click(); }
 };
@@ -845,7 +959,6 @@ function seed() {
     P('Spotify', 'Abbonamenti digitali', 'fissa_mensile', 'mensile', 10.99, 18, 1, 'addebito', 'tagliabile'),
     P('Spazio cloud', 'Abbonamenti digitali', 'fissa_mensile', 'mensile', 2.99, 3, 1, 'addebito', 'utile'),
     P('Amazon Prime', 'Abbonamenti digitali', 'fissa_non_mensile', 'annuale', 49.9, 14, 3, 'addebito', 'tagliabile'),
-    P('Carburante', 'Trasporti', 'variabile', 'mensile', 120, 28, 1, 'carta', 'essenziale'),
     P('Bollo auto', 'Trasporti', 'fissa_non_mensile', 'annuale', 215, 30, 9, 'bonifico', 'essenziale'),
     P('Rata auto', 'Finanziamenti e Rate', 'fissa_mensile', 'mensile', 210, 15, 1, 'addebito', 'essenziale', {fine: '2028-06'}),
     P('Palestra', 'Salute', 'fissa_mensile', 'mensile', 39, 1, 1, 'addebito', 'tagliabile'),
@@ -854,9 +967,13 @@ function seed() {
   ];
   S.entrate = [{id: uid(), voce: 'Stipendio', importo: 2150, mese: 0}, {id: uid(), voce: 'Tredicesima', importo: 2000, mese: 12}];
   S.imp.budgetExtra = 650;
+  const kAuto = (() => { const x = addMonths(today().y, today().m, -5); return ymKey(x.y, x.m); })();
+  S.previste.forEach(p => { if (p.metodo === 'addebito' && p.tipo !== 'variabile') { p.autoConferma = true; p.autoDal = kAuto; p.autoSkip = []; } });
+  const B = {'Spesa alimentare': 450, 'Carburante': 160, 'Ristoranti e bar': 120};
+  S.categorie.forEach(c => { c.budget = B[c.nome] || 0; });
   let r = 11; const rnd = () => (r = (r * 16807) % 2147483647) / 2147483647;
   const t = today();
-  const EX = [['Spesa alimentare', 'Supermercato', 35, 95, 8], ['Spesa alimentare', 'Mercato', 12, 30, 2], ['Ristoranti e bar', 'Pizzeria', 25, 60, 2], ['Ristoranti e bar', 'Colazione al bar', 3, 8, 4],
+  const EX = [['Spesa alimentare', 'Supermercato', 35, 95, 8], ['Spesa alimentare', 'Mercato', 12, 30, 2], ['Carburante', 'Benzina', 40, 65, 2.6], ['Ristoranti e bar', 'Pizzeria', 25, 60, 2], ['Ristoranti e bar', 'Colazione al bar', 3, 8, 4],
     ['Svago', 'Cinema', 10, 25, 1], ['Abbigliamento', 'Scarpe', 40, 90, 0.5], ['Cura personale', 'Parrucchiere', 18, 35, 1], ['Salute', 'Farmacia', 8, 30, 1.5], ['Regali', 'Regalo compleanno', 20, 50, 0.6]];
   for (let off = 5; off >= 0; off--) {
     const {y, m} = addMonths(t.y, t.m, -off), k = ymKey(y, m), last = off === 0 ? t.d : dim(y, m);
@@ -864,7 +981,7 @@ function seed() {
       if (+o.scad.slice(8) > last) return;
       let imp = o.p.importo;
       if (o.p.tipo === 'variabile') imp = Math.round(imp * (0.82 + rnd() * 0.36) * 100) / 100;
-      S.movimenti.push({id: uid(), tipo: 'prevista', previstaId: o.p.id, periodo: k, data: o.scad, importo: imp, categoriaId: o.p.categoriaId, descrizione: o.p.voce, metodo: o.p.metodo, note: ''});
+      S.movimenti.push({id: uid(), tipo: 'prevista', previstaId: o.p.id, periodo: k, data: o.scad, importo: imp, categoriaId: o.p.categoriaId, descrizione: o.p.voce, metodo: o.p.metodo, note: '', auto: !!o.p.autoConferma});
     });
     EX.forEach(([cn, desc, a, b, fr]) => {
       const n = Math.floor(fr * last / dim(y, m) + rnd());
@@ -873,7 +990,7 @@ function seed() {
   }
   // lascia un paio di voci del mese corrente da confermare
   const k0 = ymKey(t.y, t.m);
-  const daTogliere = S.movimenti.filter(x => x.tipo === 'prevista' && x.periodo === k0).slice(-2).map(x => x.id);
+  const daTogliere = S.movimenti.filter(x => x.tipo === 'prevista' && x.periodo === k0 && !x.auto).slice(-2).map(x => x.id);
   S.movimenti = S.movimenti.filter(x => !daTogliere.includes(x.id));
   save(); render(); toast('Dati di esempio caricati');
 }
@@ -893,6 +1010,10 @@ const A = {
   conferma: (el, id) => { const [pid, per] = id.split('|'); formConferma(pid, per); },
   editMov: (el, id) => formEditMov(id),
   addEnt: () => formEntrata(), editEnt: (el, id) => formEntrata(id),
+  budgets: () => formBudgets(),
+  autoAll: (el, id) => { const on = id === '1', k = ymKey(today().y, today().m);
+    S.previste.forEach(p => { if (p.metodo !== 'addebito') return; if (on && !p.autoConferma) { p.autoDal = k; p.autoSkip = []; } p.autoConferma = on; });
+    save(); if (!autoConferma()) toast(on ? 'Conferma automatica attivata' : 'Conferma automatica disattivata'); render(); },
   addCat: () => formCategoria(), editCat: (el, id) => formCategoria(id),
   mode: (el, id) => { fPrev.mode = id; render(); },
   seed: () => (S.previste.length || S.movimenti.length) ? askConfirm('Caricare i dati di esempio? <b>I dati attuali verranno sostituiti.</b>', 'Carica esempio', seed, true) : seed(),
@@ -915,11 +1036,17 @@ document.addEventListener('change', e => {
   if (k === 'fCat') { fPrev.cat = el.value; render(); }
   else if (k === 'fPrio') { fPrev.prio = el.value; render(); }
   else if (k === 'budget') { S.imp.budgetExtra = num(el.value); save(); el.value = numIn(S.imp.budgetExtra || ''); toast('Budget salvato'); }
+  else if (k === 'auto') {
+    const p = S.previste.find(x => x.id === el.dataset.id); if (!p) return;
+    if (el.checked && !p.autoConferma) { p.autoDal = ymKey(today().y, today().m); p.autoSkip = []; }
+    p.autoConferma = el.checked; save();
+    if (!autoConferma()) toast(el.checked ? `⚡ ${p.voce}: conferma automatica attiva` : `${p.voce}: conferma automatica disattivata`);
+  }
   else if (k === 'preavviso') { S.imp.preavviso = Math.max(0, Math.min(30, parseInt(el.value, 10) || 0)); save(); toast('Salvato'); }
 });
 window.addEventListener('hashchange', () => { readHash(); render(); window.scrollTo(0, 0); });
 // al ritorno sull'app (es. il giorno dopo) aggiorna stati e scadenze
-document.addEventListener('visibilitychange', () => { if (!document.hidden && !sheetOpen) render(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !sheetOpen) { autoConferma(); render(); } });
 
 // ───────────────────────── PWA ─────────────────────────
 let installEvt = null;
@@ -929,6 +1056,8 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 }
 try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) {}
 
+try { if (localStorage.getItem(KEY)) save(); } catch (e) {} // salva eventuali migrazioni
 readHash();
+autoConferma();
 render();
 })();

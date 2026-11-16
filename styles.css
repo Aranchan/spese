@@ -249,3 +249,11 @@ details.more>.list{margin-top:10px}
 td:first-child,th:first-child{position:sticky;left:0;z-index:1;background:var(--card)}
 th:first-child{z-index:2;background:var(--soft)}
 tfoot td:first-child{background:var(--soft)}
+
+/* v1.1 */
+.bud-list{display:flex;flex-direction:column;gap:16px}
+.bud .kv b.neg{color:var(--danger)}
+.tgl{width:24px;height:24px;accent-color:var(--accent);flex:none}
+.set-row .row-main{cursor:inherit}
+.switch small{font-size:.78rem;font-weight:500;line-height:1.35;display:inline-block;margin-top:3px}
+.btn-row .btn.sm{flex:1}
