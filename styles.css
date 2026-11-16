@@ -257,3 +257,10 @@ tfoot td:first-child{background:var(--soft)}
 .set-row .row-main{cursor:inherit}
 .switch small{font-size:.78rem;font-weight:500;line-height:1.35;display:inline-block;margin-top:3px}
 .btn-row .btn.sm{flex:1}
+/* v1.2 */
+.rate-line{background:var(--soft);border-radius:12px;padding:10px 12px;font-size:.88rem}
+.rate-line .kv+.kv{margin-top:4px}
+.rate-box{margin-top:-4px}
+.guide p{margin:0 0 12px;line-height:1.45}
+.guide ol{margin:0 0 14px;padding-left:20px;display:flex;flex-direction:column;gap:10px;line-height:1.45}
+input[type=time]{width:auto;max-width:140px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;font-size:1rem}

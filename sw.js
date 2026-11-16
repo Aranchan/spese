@@ -1,7 +1,7 @@
 // Service worker: app utilizzabile offline.
 // Strategia "stale-while-revalidate": risponde subito dalla cache e aggiorna in background,
 // quindi una nuova versione pubblicata compare alla riapertura successiva dell'app.
-const CACHE = 'spese-di-casa-v1.1';
+const CACHE = 'spese-di-casa-v1.3';
 const ASSETS = [
   './',
   './index.html',

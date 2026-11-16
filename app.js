@@ -49,18 +49,24 @@ function fresh() {
     v: 1,
     categorie: DEFAULT_CATS.map((c, i) => ({id:'c'+(i+1), nome:c[0], icona:c[1], uso:c[2], colore:PALETTE[i % PALETTE.length]})),
     previste: [], movimenti: [], entrate: [],
-    imp: {budgetExtra:0, preavviso:5, ultimaCat:'c10', mig11:true}
+    imp: {budgetExtra:0, preavviso:5, ultimaCat:'c10', mig11:true, mig12:true, notifOra:'09:00', notifQuando:'giorno', notifAuto:true, icsAt:'', icsSig:''}
   };
 }
 function normalize(s) {
   const f = fresh();
   const out = Object.assign(f, s || {});
-  out.imp = Object.assign(fresh().imp, {mig11:false}, (s && s.imp) || {});
+  out.imp = Object.assign(fresh().imp, {mig11:false, mig12:false}, (s && s.imp) || {});
   // v1.1: categoria Carburante per chi aveva già dei dati
   if (!out.imp.mig11) {
     if (Array.isArray(out.categorie) && !out.categorie.some(c => (c.nome || '').toLowerCase() === 'carburante'))
       out.categorie.push({id: 'c' + uid(), nome: 'Carburante', icona: '⛽', uso: 'entrambe', colore: '#c4623f'});
     out.imp.mig11 = true;
+  }
+  // v1.2: le voci con "Fino al mese" nella categoria finanziamenti diventano rate
+  if (!out.imp.mig12) {
+    const fin = (out.categorie || []).filter(c => /finanz|rate/i.test(c.nome || '')).map(c => c.id);
+    (out.previste || []).forEach(p => { if (p.fine && fin.includes(p.categoriaId) && p.rate === undefined) p.rate = true; });
+    out.imp.mig12 = true;
   }
   ['categorie','previste','movimenti','entrate'].forEach(k => { if (!Array.isArray(out[k])) out[k] = k === 'categorie' ? fresh().categorie : []; });
   return out;
@@ -80,7 +86,16 @@ let S = load();
 // ───────────────────────── Calcoli ─────────────────────────
 const cat = id => S.categorie.find(c => c.id === id) || {id:'', nome:'Senza categoria', icona:'📦', colore:'#888'};
 const nAnno = p => (FREQ[p.frequenza] || FREQ.mensile).n;
-const annuo = p => (+p.importo || 0) * nAnno(p);
+// Bollette (v1.3): stima = media delle ultime 3 bollette pagate, se ce ne sono
+function stimaPer(p, k) {
+  if (!p.bolletta || !p.id) return +p.importo || 0;
+  const pag = S.movimenti.filter(x => x.tipo === 'prevista' && x.previstaId === p.id && x.periodo < k)
+    .sort((a, b) => b.periodo.localeCompare(a.periodo)).slice(0, 3);
+  return pag.length ? Math.round(sum(pag, x => x.importo) / pag.length * 100) / 100 : (+p.importo || 0);
+}
+const impPrev = p => stimaPer(p, '9999-12');
+const nStima = p => p.bolletta && p.id ? Math.min(3, S.movimenti.filter(x => x.tipo === 'prevista' && x.previstaId === p.id).length) : 0;
+const annuo = p => impPrev(p) * nAnno(p);
 const mensileEq = p => annuo(p) / 12;
 const attive = () => S.previste.filter(p => p.attiva !== false);
 
@@ -108,10 +123,16 @@ function scadenzaTesto(p) {
 function occorrenze(y, m) {
   const k = ymKey(y, m);
   return S.previste.filter(p => dovuta(p, y, m)).map(p => {
-    const g = p.giorno ? Math.min(+p.giorno, dim(y, m)) : dim(y, m);
     const mov = S.movimenti.find(x => x.tipo === 'prevista' && x.previstaId === p.id && x.periodo === k);
-    return {p, periodo:k, scad:`${k}-${pad(g)}`, mov};
-  }).sort((a, b) => a.scad.localeCompare(b.scad));
+    return Object.assign(occDi(p, y, m), {mov});
+  }).sort((a, b) => (a.attesa - b.attesa) || a.scad.localeCompare(b.scad));
+}
+// dati di una scadenza: per le bollette inserite valgono data e importo della bolletta
+function occDi(p, y, m) {
+  const k = ymKey(y, m), base = `${k}-${pad(p.giorno ? Math.min(+p.giorno, dim(y, m)) : dim(y, m))}`;
+  const ov = (p.bolletta && p.bollette && p.bollette[k]) || null;
+  const stima = stimaPer(p, k);
+  return {p, periodo: k, scad: ov ? ov.data : base, importo: ov ? +ov.importo : stima, stima, ov, attesa: !!p.bolletta && !ov};
 }
 // conferme "orfane": spese previste confermate per il mese ma poi disattivate/modificate
 function confermeOrfane(y, m, occ) {
@@ -122,7 +143,7 @@ function confermeOrfane(y, m, occ) {
 function spesoCategoria(cid, y, m) {
   const k = ymKey(y, m);
   const speso = sum(S.movimenti.filter(x => x.categoriaId === cid && (x.tipo === 'extra' ? (x.data || '').startsWith(k) : x.periodo === k)), x => x.importo);
-  const daConf = sum(occorrenze(y, m).filter(o => !o.mov && o.p.categoriaId === cid), o => o.p.importo);
+  const daConf = sum(occorrenze(y, m).filter(o => !o.mov && o.p.categoriaId === cid), o => o.importo);
   return {speso, daConf};
 }
 function mediaCategoria(cid, mesi) {
@@ -140,9 +161,9 @@ function autoConferma() {
     for (let guard = 0; ymKey(y, m) <= kNow && guard < 36; guard++) {
       const k = ymKey(y, m);
       if (dovuta(p, y, m) && !(p.autoSkip || []).includes(k)) {
-        const scad = `${k}-${pad(p.giorno ? Math.min(+p.giorno, dim(y, m)) : dim(y, m))}`;
-        if (scad <= iso && !S.movimenti.some(x => x.tipo === 'prevista' && x.previstaId === p.id && x.periodo === k)) {
-          S.movimenti.push({id: uid(), tipo: 'prevista', previstaId: p.id, periodo: k, data: scad, importo: p.importo, categoriaId: p.categoriaId, descrizione: p.voce, metodo: p.metodo, note: '', auto: true});
+        const o = occDi(p, y, m);  // le bollette si confermano solo dopo averle inserite
+        if (!o.attesa && o.scad <= iso && !S.movimenti.some(x => x.tipo === 'prevista' && x.previstaId === p.id && x.periodo === k)) {
+          S.movimenti.push({id: uid(), tipo: 'prevista', previstaId: p.id, periodo: k, data: o.scad, importo: o.importo, categoriaId: p.categoriaId, descrizione: p.voce, metodo: p.metodo, note: '', auto: true});
           nomi.push(p.voce);
         }
       }
@@ -170,7 +191,7 @@ function datiMese(y, m) {
   const da = occ.filter(o => !o.mov), ok = occ.filter(o => o.mov), orf = confermeOrfane(y, m, occ);
   const ex = extraMese(k);
   const totOk = sum(ok, o => o.mov.importo) + sum(orf, x => x.importo);
-  const totDa = sum(da, o => o.p.importo);
+  const totDa = sum(da, o => o.importo);
   const totEx = sum(ex, x => x.importo);
   const ent = entrateMese(m);
   return {k, occ, da, ok, orf, ex, totOk, totDa, totEx, ent, pagato: totOk + totEx, resto: ent - totOk - totEx - totDa};
@@ -205,32 +226,84 @@ const bar = (pct, color, over) => `<div class="bar${over ? ' over' : ''}"><i sty
 
 function statoOcc(o) {
   const t = today(), kNow = ymKey(t.y, t.m);
-  if (o.periodo < kNow) return {cls:'danger', txt:'Non confermata'};
-  if (o.periodo > kNow) return {cls:'', txt:'Scade il ' + fmtData(o.scad)};
+  if (o.attesa) return o.periodo < kNow ? {cls:'danger', txt:'Bolletta non inserita'} : {cls:'', txt:'📄 In attesa della bolletta'};
+  if (o.periodo < kNow && !o.ov) return {cls:'danger', txt:'Non confermata'};
+  if (o.periodo > kNow && !o.ov) return {cls:'', txt:'Scade il ' + fmtData(o.scad)};
   const dd = daysBetween(isoToday(), o.scad);
+  if (dd > 0 && o.periodo > kNow) return {cls:'', txt:'Scade il ' + fmtData(o.scad)};
   if (dd < 0) return {cls:'danger', txt:`Scaduta il ${fmtData(o.scad)}`};
   if (dd === 0) return {cls:'warn', txt:'Scade oggi'};
   if (dd <= (+S.imp.preavviso || 0)) return {cls:'warn', txt:`Tra ${dd} g · ${fmtData(o.scad)}`};
   return {cls:'', txt:'Scade il ' + fmtData(o.scad)};
 }
 const isAuto = p => !!p.autoConferma && p.metodo === 'addebito';
+
+// ── Rate e finanziamenti: una rata per ogni periodo di pagamento fino all'ultima rata
+function periodiDovuti(p, fromK, toK) {
+  const out = [];
+  if (!fromK || !toK || fromK > toK) return out;
+  let y = +fromK.slice(0, 4), m = +fromK.slice(5, 7);
+  const md = mesiDovuti(p);
+  for (let g = 0; ymKey(y, m) <= toK && g < 720; g++) { if (md.includes(m)) out.push(ymKey(y, m)); ({y, m} = addMonths(y, m, 1)); }
+  return out;
+}
+function nEsimoPeriodo(p, fromK, n) {
+  if (!fromK || !(n > 0)) return '';
+  let y = +fromK.slice(0, 4), m = +fromK.slice(5, 7), c = 0;
+  const md = mesiDovuti(p);
+  for (let g = 0; g < 720; g++) { if (md.includes(m) && ++c === n) return ymKey(y, m); ({y, m} = addMonths(y, m, 1)); }
+  return '';
+}
+const confermataIn = (p, k) => S.movimenti.some(x => x.tipo === 'prevista' && x.previstaId === p.id && x.periodo === k);
+function primoDaPagare(p) {
+  const t = today(); let k = ymKey(t.y, t.m);
+  if (p.inizio && p.inizio > k) k = p.inizio;
+  let y = +k.slice(0, 4), m = +k.slice(5, 7);
+  const md = mesiDovuti(p);
+  for (let g = 0; g < 720; g++) { const kk = ymKey(y, m); if (md.includes(m) && !confermataIn(p, kk)) return kk; ({y, m} = addMonths(y, m, 1)); }
+  return k;
+}
+function rateInfo(p) {
+  if (!p.rate || !p.fine) return null;
+  const t = today(), kNow = ymKey(t.y, t.m);
+  const da = p.inizio && p.inizio > kNow ? p.inizio : kNow;
+  const futuri = periodiDovuti(p, da, p.fine).filter(k => !confermataIn(p, k));
+  const mancanti = futuri.length;
+  const totali = +p.numRate || (p.inizio ? periodiDovuti(p, p.inizio, p.fine).length : null);
+  const pagate = totali ? Math.max(0, totali - mancanti) : null;
+  return {totali, mancanti, pagate, residuo: mancanti * (+p.importo || 0), ultima: p.fine, prossima: futuri[0] || null, finita: mancanti === 0};
+}
+function numeroRata(p, k) {
+  const ri = rateInfo(p); if (!ri || !ri.totali) return null;
+  const n = ri.totali - periodiDovuti(p, k, p.fine).length + 1;
+  return n >= 1 && n <= ri.totali ? {n, tot: ri.totali} : null;
+}
+function pillRata(p, k) {
+  if (!p.rate) return '';
+  const r = numeroRata(p, k);
+  if (r && r.n === r.tot) return '<span class="pill ok">🎉 ultima rata</span>';
+  if (r) return `<span class="pill">rata ${r.n}/${r.tot}</span>`;
+  return k === p.fine ? '<span class="pill ok">🎉 ultima rata</span>' : '';
+}
 function rowDaConfermare(o) {
   const p = o.p, c = cat(p.categoriaId), st = statoOcc(o);
   return `<div class="row">
     ${catIc(c)}
-    <div class="row-main" data-a="conferma" data-id="${p.id}|${o.periodo}">
+    <div class="row-main" data-a="${o.attesa ? 'bolletta' : 'conferma'}" data-id="${p.id}|${o.periodo}">
       <div class="row-t">${h(p.voce)}</div>
-      <div class="row-s"><span class="pill ${st.cls}">${st.txt}</span><span>${METODI[p.metodo] || ''}${nAnno(p) < 12 ? ' · ' + FREQ[p.frequenza].l.toLowerCase() : ''}${p.tipo === 'variabile' ? ' · stima' : ''}</span>${isAuto(p) ? '<span class="pill ok">⚡ automatica</span>' : ''}</div>
+      <div class="row-s"><span class="pill ${st.cls}">${st.txt}</span><span>${METODI[p.metodo] || ''}${nAnno(p) < 12 ? ' · ' + FREQ[p.frequenza].l.toLowerCase() : ''}${o.attesa || (p.tipo === 'variabile' && !o.ov) ? ' · stima' : ''}</span>${o.ov ? '<span class="pill ok">📄 bolletta</span>' : ''}${isAuto(p) ? '<span class="pill ok">⚡ automatica</span>' : ''}${pillRata(p, o.periodo)}</div>
     </div>
-    <div class="row-r"><div class="amt">${fmt(p.importo)}</div><button class="btn sm" data-a="conferma" data-id="${p.id}|${o.periodo}">Conferma</button></div>
+    <div class="row-r"><div class="amt">${o.attesa ? '<span class="muted" style="font-weight:500">≈ </span>' : ''}${fmt(o.importo)}</div>${o.attesa
+      ? `<button class="btn sm ghost" data-a="bolletta" data-id="${p.id}|${o.periodo}">📄 Inserisci</button>`
+      : `<button class="btn sm" data-a="conferma" data-id="${p.id}|${o.periodo}">Conferma</button>`}</div>
   </div>`;
 }
 function rowConfermata(o) {
-  const p = o.p, mv = o.mov, diff = Math.round((mv.importo - p.importo) * 100) / 100;
+  const p = o.p, mv = o.mov, diff = Math.round((mv.importo - (o.ov ? o.ov.importo : o.stima)) * 100) / 100;
   return `<div class="row tap" data-a="conferma" data-id="${p.id}|${o.periodo}">
     <span class="check">✓</span>
     <div class="row-main"><div class="row-t">${h(p.voce)}</div>
-      <div class="row-s"><span>Pagata il ${fmtData(mv.data)} · ${METODI[mv.metodo] || ''}</span>${mv.auto ? '<span class="pill ok">⚡ automatica</span>' : ''}${diff ? `<span class="pill ${diff > 0 ? 'danger' : 'ok'}">${diff > 0 ? '+' : ''}${fmt(diff)} sul previsto</span>` : ''}</div></div>
+      <div class="row-s"><span>Pagata il ${fmtData(mv.data)} · ${METODI[mv.metodo] || ''}</span>${mv.auto ? '<span class="pill ok">⚡ automatica</span>' : ''}${pillRata(p, o.periodo)}${diff ? `<span class="pill ${diff > 0 ? 'danger' : 'ok'}">${diff > 0 ? '+' : ''}${fmt(diff)} ${o.ov ? 'sulla bolletta' : 'sul previsto'}</span>` : ''}</div></div>
     <div class="amt">${fmt(mv.importo)}</div>
   </div>`;
 }
@@ -288,9 +361,14 @@ function vMese() {
     <div class="hint" style="margin-top:8px">${d.totEx > b ? `Hai superato il budget di <b>${fmt(d.totEx - b)}</b>.` : `Puoi ancora spendere <b>${fmt(b - d.totEx)}</b> in extra questo mese.`}</div>
   </section>` : ''}
 
+  ${(() => { const att = d.da.filter(o => o.attesa); if (!att.length) return '';
+    return `<div class="tip"><span class="em">📄</span><div>${att.length === 1 ? 'Hai una bolletta' : `Hai <b>${att.length}</b> bollette`} da inserire per ${MESI[cur.m - 1].toLowerCase()}: ${att.map(o => `<button class="link" data-a="bolletta" data-id="${o.p.id}|${o.periodo}">${h(o.p.voce)}</button>`).join(', ')}. Appena conosci data e importo, inseriscili: l'app li userà per scadenze, saldo e budget.</div></div>`; })()}
+
+  ${avvisoCalendario()}
+
   ${budgetCategorie(cur.y, cur.m)}
 
-  ${prossimeNonMensili.length ? `<div class="tip warn"><span class="em">📌</span><div>Questo mese ci sono <b>${prossimeNonMensili.length}</b> spese non mensili da pagare (${prossimeNonMensili.map(o => h(o.p.voce)).join(', ')}) per <b>${fmt(sum(prossimeNonMensili, o => o.p.importo))}</b>.</div></div>` : ''}
+  ${prossimeNonMensili.length ? `<div class="tip warn"><span class="em">📌</span><div>Questo mese ci sono <b>${prossimeNonMensili.length}</b> spese non mensili da pagare (${prossimeNonMensili.map(o => h(o.p.voce)).join(', ')}) per <b>${fmt(sum(prossimeNonMensili, o => o.importo))}</b>.</div></div>` : ''}
 
   <section>
     <div class="sec-h"><h2>Da confermare<span class="count">${d.da.length}</span></h2><span class="muted small">${fmt(d.totDa)}</span></div>
@@ -348,8 +426,8 @@ function vPreviste() {
       <thead><tr><th>Voce</th><th>Categoria</th><th>Tipo</th><th>Frequenza</th><th class="n">Importo</th><th class="n">Mensile eq.</th><th class="n">Annuo</th><th>Scadenza</th><th>Metodo</th><th>Priorità</th></tr></thead>
       <tbody>${list.map(p => { const c = cat(p.categoriaId); return `<tr data-a="editPrev" data-id="${p.id}" class="${p.attiva === false ? 'off' : ''}">
         <td><b>${h(p.voce)}</b></td><td>${h(c.icona)} ${h(c.nome)}</td><td>${TIPI[p.tipo] || ''}</td><td>${FREQ[p.frequenza].l}</td>
-        <td class="n">${fmt(p.importo)}</td><td class="n">${fmt(mensileEq(p))}</td><td class="n">${fmt(annuo(p))}</td>
-        <td>${h(scadenzaTesto(p))}</td><td>${METODI[p.metodo] || ''}${isAuto(p) ? ' ⚡' : ''}</td><td><span class="prio prio-${p.priorita}">${PRIO[p.priorita] || ''}</span></td></tr>`; }).join('')}</tbody>
+        <td class="n">${p.bolletta ? '≈ ' : ''}${fmt(impPrev(p))}</td><td class="n">${fmt(mensileEq(p))}</td><td class="n">${fmt(annuo(p))}</td>
+        <td>${h(scadenzaTesto(p))}${(r => r ? ` · ${r.mancanti} rate mancanti` : '')(rateInfo(p))}</td><td>${METODI[p.metodo] || ''}${isAuto(p) ? ' ⚡' : ''}</td><td><span class="prio prio-${p.priorita}">${PRIO[p.priorita] || ''}</span></td></tr>`; }).join('')}</tbody>
       <tfoot><tr><td colspan="5">Totale${filtrato ? ' (filtro)' : ''} · solo attive</td><td class="n">${fmt(sum(lAtt, mensileEq))}</td><td class="n">${fmt(sum(lAtt, annuo))}</td><td colspan="3"></td></tr></tfoot>
     </table></div>`
     : `<div style="display:flex;flex-direction:column;gap:10px">${list.map(cardPrev).join('') || '<div class="card empty-s">Nessuna voce con questi filtri.</div>'}</div>`;
@@ -364,17 +442,28 @@ function vPreviste() {
   ${filtrato ? `<div class="hint">Filtro attivo: ${lAtt.length} voci · ${fmt(sum(lAtt, mensileEq))}/mese · ${fmt(sum(lAtt, annuo))}/anno</div>` : ''}
   ${body}`;
 }
+function rateBox(p) {
+  const ri = rateInfo(p); if (!ri) return '';
+  if (ri.finita) return `<div class="rate-line"><b>✓ Finanziamento concluso</b> <span class="muted small">· ultima rata ${fmtYM(ri.ultima)}</span></div>`;
+  return `<div class="rate-line">
+    <div class="kv small"><span>${ri.totali ? `Pagate <b>${ri.pagate}</b> di ${ri.totali}` : '💳 Finanziamento'}</span><span><b>${ri.mancanti}</b> ${ri.mancanti === 1 ? 'rata mancante' : 'rate mancanti'}</span></div>
+    ${ri.totali ? `<div style="margin:7px 0">${bar(ri.pagate / ri.totali * 100)}</div>` : ''}
+    <div class="kv small"><span class="muted">Debito residuo</span><b>${fmt(ri.residuo)}</b></div>
+    <div class="kv small"><span class="muted">Ultima rata</span><b>${MESI[+ri.ultima.slice(5, 7) - 1].toLowerCase()} ${ri.ultima.slice(0, 4)}</b></div>
+  </div>`;
+}
 function cardPrev(p) {
   const c = cat(p.categoriaId);
   return `<div class="card prev${p.attiva === false ? ' off' : ''}" data-a="editPrev" data-id="${p.id}">
     <div class="prev-top">${catIc(c)}<div><div class="row-t">${h(p.voce)}</div><div class="row-s">${h(c.nome)} · ${TIPI[p.tipo] || ''}${p.attiva === false ? ' · <b>disattivata</b>' : ''}</div></div>
       <span class="prio prio-${p.priorita}">${PRIO[p.priorita] || ''}</span></div>
     <div class="prev-nums">
-      <div><span>Per pagamento</span><b>${fmt(p.importo)}</b><small>${FREQ[p.frequenza].l}</small></div>
+      <div><span>${p.bolletta ? 'Stima' : 'Per pagamento'}</span><b>${fmt(impPrev(p))}</b><small>${p.bolletta && nStima(p) ? `media ultime ${nStima(p)}` : FREQ[p.frequenza].l}</small></div>
       <div><span>Mensile equiv.</span><b>${fmt(mensileEq(p))}</b></div>
       <div><span>Annuo</span><b>${fmt(annuo(p))}</b></div>
     </div>
-    <div class="row-s">📅 ${h(scadenzaTesto(p))} · ${METODI[p.metodo] || ''}${isAuto(p) ? ' · ⚡ conferma automatica' : ''}${p.fine ? ' · fino a ' + fmtYM(p.fine) : ''}${p.inizio ? ' · da ' + fmtYM(p.inizio) : ''}</div>
+    ${rateBox(p)}
+    <div class="row-s">${p.bolletta ? '📄 data e importo dalla bolletta' : '📅 ' + h(scadenzaTesto(p))} · ${METODI[p.metodo] || ''}${isAuto(p) ? ' · ⚡ conferma automatica' : ''}${p.fine ? ' · fino a ' + fmtYM(p.fine) : ''}${p.inizio ? ' · da ' + fmtYM(p.inizio) : ''}</div>
   </div>`;
 }
 
@@ -425,6 +514,8 @@ function vCategorie() {
     </div>
   </section>
 
+  ${sezioneRate(att)}
+
   ${tagl.length ? `<section>
     <div class="sec-h"><h2>✂️ Simulazione tagli</h2></div>
     <div class="tip warn"><span class="em">💡</span><div>Eliminando tutte le voci <b>tagliabili</b> risparmieresti <b>${fmt(sum(tagl, mensileEq))} al mese</b>, cioè <b>${fmt(sum(tagl, annuo))} all'anno</b>.</div></div>
@@ -445,13 +536,33 @@ function vCategorie() {
   `;
 }
 
+function sezioneRate(att) {
+  const fin = att.map(p => ({p, ri: rateInfo(p)})).filter(x => x.ri && !x.ri.finita).sort((a, b) => a.ri.ultima.localeCompare(b.ri.ultima));
+  if (!fin.length) return '';
+  const tot = sum(fin, x => x.ri.residuo), mens = sum(fin, x => mensileEq(x.p));
+  const prima = fin[0], libera = addMonths(+prima.ri.ultima.slice(0, 4), +prima.ri.ultima.slice(5, 7), 1);
+  return `<section>
+    <div class="sec-h"><h2>💳 Rate e finanziamenti</h2></div>
+    <div class="stats">
+      <div class="stat"><span>Debito residuo</span><b>${fmt(tot)}</b></div>
+      <div class="stat"><span>Rate al mese</span><b>${fmt(mens)}</b></div>
+      <div class="stat"><span>Finanziamenti</span><b>${fin.length}</b></div>
+    </div>
+    <div class="list">${fin.map(({p, ri}) => `<div class="row tap" data-a="editPrev" data-id="${p.id}">${catIc(cat(p.categoriaId), 1)}
+      <div class="row-main"><div class="row-t">${h(p.voce)}</div><div class="row-s">${ri.mancanti} rate mancanti · ultima ${fmtYM(ri.ultima)}</div>
+      ${ri.totali ? `<div style="margin-top:7px">${bar(ri.pagate / ri.totali * 100)}</div>` : ''}</div>
+      <div class="amt">${fmt(ri.residuo)}<small>${fmt(p.importo)}/rata</small></div></div>`).join('')}</div>
+    <div class="tip"><span class="em">🎯</span><div>Da <b>${MESI[libera.m - 1].toLowerCase()} ${libera.y}</b>, finito "${h(prima.p.voce)}", avrai <b>${fmt(mensileEq(prima.p))} in più al mese</b>.</div></div>
+  </section>`;
+}
+
 // ───────────────────────── Vista: Report ─────────────────────────
 function vReport() {
   if (!S.previste.length && !S.movimenti.length) return welcome();
   const d = datiMese(cur.y, cur.m), b = +S.imp.budgetExtra || 0;
   const nTot = d.occ.length, nOk = d.ok.length;
-  const prevOk = sum(d.ok, o => o.p.importo), effOk = sum(d.ok, o => o.mov.importo), scost = effOk - prevOk;
-  const diffs = d.ok.filter(o => Math.abs(o.mov.importo - o.p.importo) >= 0.01).sort((a, b) => Math.abs(b.mov.importo - b.p.importo) - Math.abs(a.mov.importo - a.p.importo));
+  const prevOk = sum(d.ok, o => o.stima), effOk = sum(d.ok, o => o.mov.importo), scost = effOk - prevOk;
+  const diffs = d.ok.filter(o => Math.abs(o.mov.importo - o.stima) >= 0.01).sort((a, b) => Math.abs(b.mov.importo - b.stima) - Math.abs(a.mov.importo - a.stima));
   const exG = S.categorie.map(c => { const it = d.ex.filter(x => x.categoriaId === c.id); return {c, n: it.length, t: sum(it, x => x.importo)}; }).filter(g => g.n).sort((a, b) => b.t - a.t);
 
   // andamento ultimi 6 mesi
@@ -474,7 +585,7 @@ function vReport() {
 
   ${diffs.length ? `<section>
     <div class="sec-h"><h2>Previsto vs effettivo</h2></div>
-    <div class="list">${diffs.map(o => { const df = o.mov.importo - o.p.importo; return `<div class="row tap" data-a="conferma" data-id="${o.p.id}|${o.periodo}">${catIc(cat(o.p.categoriaId), 1)}<div class="row-main"><div class="row-t">${h(o.p.voce)}</div><div class="row-s">previsto ${fmt(o.p.importo)} · pagato ${fmt(o.mov.importo)}</div></div><div class="amt ${df > 0 ? 'neg' : ''}">${df > 0 ? '+' : ''}${fmt(df)}</div></div>`; }).join('')}</div>
+    <div class="list">${diffs.map(o => { const df = o.mov.importo - o.stima; return `<div class="row tap" data-a="conferma" data-id="${o.p.id}|${o.periodo}">${catIc(cat(o.p.categoriaId), 1)}<div class="row-main"><div class="row-t">${h(o.p.voce)}</div><div class="row-s">${o.p.bolletta ? 'stima' : 'previsto'} ${fmt(o.stima)} · pagato ${fmt(o.mov.importo)}</div></div><div class="amt ${df > 0 ? 'neg' : ''}">${df > 0 ? '+' : ''}${fmt(df)}</div></div>`; }).join('')}</div>
   </section>` : ''}
 
   <section>
@@ -539,6 +650,18 @@ function vAltro() {
   </section>
 
   <section>
+    <div class="sec-h"><h2>🔔 Notifiche scadenze</h2><button class="link" data-a="icsHelp">Come funziona</button></div>
+    <div class="hint">Le notifiche arrivano da Google Calendar: esporti le scadenze dei prossimi 12 mesi e le importi una volta. Ricevi una notifica al giorno, solo nei giorni con scadenze.</div>
+    <div class="list">
+      <div class="set-row"><div><div class="row-t">Ora della notifica</div></div><input type="time" data-ch="notifOra" value="${h(S.imp.notifOra || '09:00')}"></div>
+      <div class="set-row"><div><div class="row-t">Quando</div></div><select data-ch="notifQuando" style="max-width:170px"><option value="giorno"${S.imp.notifQuando !== 'prima' ? ' selected' : ''}>Il giorno stesso</option><option value="prima"${S.imp.notifQuando === 'prima' ? ' selected' : ''}>Il giorno prima</option></select></div>
+      <label class="set-row" style="cursor:pointer"><div class="row-main"><div class="row-t">Includi addebiti automatici</div><div class="row-s">Avvisa anche per gli addebiti che si confermano da soli</div></div><input type="checkbox" class="tgl" data-ch="notifAuto"${S.imp.notifAuto ? ' checked' : ''}></label>
+    </div>
+    <button class="btn block" data-a="exportIcs">📅 Esporta calendario scadenze</button>
+    <div class="hint" style="text-align:center">${S.imp.icsAt ? `Ultima esportazione: ${fmtData(S.imp.icsAt)}${S.imp.icsSig !== firmaCalendario() ? ' · <b style="color:var(--warn)">da aggiornare</b>' : ' · aggiornato ✓'}` : 'Non ancora esportato'}</div>
+  </section>
+
+  <section>
     <div class="sec-h"><h2>⚡ Conferma automatica addebiti</h2></div>
     ${(() => { const add = S.previste.filter(p => p.metodo === 'addebito' && p.attiva !== false).sort((a, b) => a.voce.localeCompare(b.voce));
       return add.length ? `<div class="hint">Gli addebiti attivati qui vengono confermati da soli il giorno della scadenza. Le bollette variabili vengono confermate con l'importo previsto: potrai correggerlo in seguito.</div>
@@ -567,7 +690,7 @@ function vAltro() {
       <div class="set-row tap" data-a="seed"><div><div class="row-t">Carica dati di esempio</div><div class="row-s">Sostituisce i dati attuali</div></div><span class="muted">›</span></div>
       <div class="set-row tap" data-a="reset"><div><div class="row-t" style="color:var(--danger)">Cancella tutti i dati</div><div class="row-s">Operazione non reversibile</div></div><span class="muted">›</span></div>
     </div>
-    <div class="hint" style="text-align:center">Spese di Casa · v1.1 · ${S.previste.length} previste · ${S.movimenti.length} movimenti</div>
+    <div class="hint" style="text-align:center">Spese di Casa · v1.3 · ${S.previste.length} previste · ${S.movimenti.length} movimenti</div>
   </section>`;
 }
 
@@ -630,11 +753,20 @@ function formPrevista(id) {
     <div class="calc"><div><span>Mensile equiv.</span><b id="fp-me">—</b></div><div><span>Annuo</span><b id="fp-an">—</b></div></div>
     <div class="field"><span class="flabel">Metodo di pagamento</span>${chipsRadio('metodo', METODI, p.metodo)}</div>
     <div class="field"><span class="flabel">Priorità</span>${chipsRadio('priorita', PRIO, p.priorita)}</div>
-    <div class="grid2">
-      <div class="field"><label for="fp-in">Dal mese <span style="text-transform:none;font-weight:500">(opz.)</span></label><input type="month" id="fp-in" name="inizio" value="${h(p.inizio || '')}"></div>
-      <div class="field"><label for="fp-fi">Fino al mese <span style="text-transform:none;font-weight:500">(opz.)</span></label><input type="month" id="fp-fi" name="fine" value="${h(p.fine || '')}"></div>
+    <label class="switch"><span>📄 Bolletta: data e importo cambiano ogni mese<br><small class="muted" id="fp-bol-h">Ogni mese inserisci data e importo appena li conosci. Finché non li inserisci, l'app usa come stima la media delle ultime 3 bollette.</small></span><input type="checkbox" name="bolletta"${p.bolletta ? ' checked' : ''}></label>
+    <label class="switch"><span>💳 Pagamento a rate / finanziamento</span><input type="checkbox" name="rate"${p.rate ? ' checked' : ''}></label>
+    <div id="fp-rate-box" class="rate-box">
+      <div class="grid2">
+        <div class="field"><label for="fp-nr">Rate totali</label><input type="number" min="1" max="600" inputmode="numeric" id="fp-nr" name="numRate" value="${+p.numRate || ''}" placeholder="es. 48"></div>
+        <div class="field"><label for="fp-rm">Rate mancanti</label><input type="number" min="0" max="600" inputmode="numeric" id="fp-rm" placeholder="es. 19"></div>
+      </div>
     </div>
-    <div class="hint" style="margin-top:-6px">Utile per rate e finanziamenti: dopo l'ultima rata la voce smette di comparire.</div>
+    <div class="grid2">
+      <div class="field"><label for="fp-in" id="fp-in-l">Dal mese (opz.)</label><input type="month" id="fp-in" name="inizio" value="${h(p.inizio || '')}"></div>
+      <div class="field"><label for="fp-fi" id="fp-fi-l">Fino al mese (opz.)</label><input type="month" id="fp-fi" name="fine" value="${h(p.fine || '')}"></div>
+    </div>
+    <div class="hint" id="fp-dates-h" style="margin-top:-6px"></div>
+    <div class="calc" id="fp-rate-sum"></div>
     <div class="field"><label for="fp-note">Note</label><input type="text" id="fp-note" name="note" value="${h(p.note || '')}" placeholder="es. codice cliente, IBAN…"></div>
     <label class="switch" id="fp-auto-w"><span>⚡ Conferma automatica alla scadenza<br><small class="muted" id="fp-auto-h">Il giorno della scadenza l'addebito viene confermato da solo.</small></span><input type="checkbox" name="autoConferma"${p.autoConferma ? ' checked' : ''}></label>
     <label class="switch"><span>Voce attiva</span><input type="checkbox" name="attiva"${p.attiva !== false ? ' checked' : ''}></label>
@@ -654,12 +786,59 @@ function formPrevista(id) {
       $('#fp-me', el).textContent = tmp.importo ? fmt(mensileEq(tmp)) : '—';
       $('#fp-an', el).textContent = tmp.importo ? fmt(annuo(tmp)) : '—';
       const met = (f.querySelector('[name=metodo]:checked') || {}).value;
+      $('#fp-imp', el).previousElementSibling.textContent = f.bolletta.checked ? 'Importo stimato' : 'Importo per pagamento';
+      $('#fp-g', el).previousElementSibling.textContent = f.bolletta.checked ? 'Giorno indicativo' : 'Giorno scadenza';
+      if (f.bolletta.checked && !nuovo && nStima(p)) $('#fp-bol-h', el).innerHTML = `Stima attuale: <b>${fmt(impPrev(p))}</b>, media delle ultime ${nStima(p)} bollette. L'importo qui sotto si usa solo finché non ci sono bollette pagate.`;
       $('#fp-auto-w', el).style.display = met === 'addebito' ? '' : 'none';
       $('#fp-auto-h', el).textContent = tipo.value === 'variabile'
         ? "Viene confermato con l'importo previsto: potrai correggerlo quando arriva la bolletta."
         : "Il giorno della scadenza l'addebito viene confermato da solo.";
     };
+    // ── rate: due dati qualsiasi tra prima rata, ultima rata, rate totali e rate mancanti bastano a calcolare il resto
+    const nr = f.numRate, rm = $('#fp-rm', el);
+    const tmpP = () => {
+      const fq = tipo.value === 'fissa_mensile' ? 'mensile' : freq.value;
+      const mr = f.inizio.value && fq !== 'mensile' ? +f.inizio.value.slice(5, 7) : +f.meseRif.value;
+      return {id: id || '__nuova__', frequenza: fq, meseRif: mr, importo: num(f.importo.value), inizio: f.inizio.value, fine: f.fine.value, rate: true, numRate: +nr.value || 0, attiva: true};
+    };
+    const updRate = keepRm => {
+      const on = f.rate.checked;
+      $('#fp-rate-box', el).style.display = on ? '' : 'none';
+      $('#fp-in-l', el).textContent = on ? 'Prima rata (opz.)' : 'Dal mese (opz.)';
+      $('#fp-fi-l', el).textContent = on ? 'Ultima rata' : 'Fino al mese (opz.)';
+      $('#fp-dates-h', el).textContent = on
+        ? 'Inserisci due dati qualsiasi (prima rata, ultima rata, rate totali o rate mancanti): il resto si calcola da solo, una rata per periodo. Dopo l\'ultima rata la voce smette di comparire.'
+        : 'Facoltativi: per spese che iniziano o finiscono in un certo mese.';
+      const box = $('#fp-rate-sum', el);
+      if (on && f.fine.value) {
+        const ri = rateInfo(tmpP());
+        box.style.display = '';
+        box.innerHTML = `<div><span>Rate mancanti</span><b>${ri.mancanti}${ri.totali ? ' / ' + ri.totali : ''}</b></div><div><span>Debito residuo</span><b>${fmt(ri.residuo)}</b></div>`;
+        if (!keepRm) rm.value = ri.mancanti;
+      } else { box.style.display = 'none'; if (!keepRm) rm.value = ''; }
+    };
     f.addEventListener('input', sync); f.addEventListener('change', sync); sync();
+    f.addEventListener('input', e => {
+      const tg = e.target;
+      if (f.rate.checked) {
+        const tp = tmpP();
+        if (tg === nr || tg === f.inizio) {
+          if (f.inizio.value && +nr.value > 0) f.fine.value = nEsimoPeriodo(tp, f.inizio.value, +nr.value) || f.fine.value;
+          else if (tg === f.inizio && f.inizio.value && f.fine.value) nr.value = periodiDovuti(tp, f.inizio.value, f.fine.value).length || '';
+        } else if (tg === f.fine) {
+          if (f.inizio.value && f.fine.value) nr.value = periodiDovuti(tp, f.inizio.value, f.fine.value).length || '';
+        } else if (tg === rm) {
+          const n = parseInt(rm.value, 10);
+          if (n > 0) {
+            f.fine.value = nEsimoPeriodo(tp, primoDaPagare(tp), n);
+            if (f.inizio.value) nr.value = periodiDovuti(tmpP(), f.inizio.value, f.fine.value).length || '';
+          }
+        }
+      }
+      updRate(tg === rm);
+    });
+    f.addEventListener('change', e => { if (e.target === f.rate) updRate(false); });
+    updRate(false);
     if (nuovo) setTimeout(() => f.voce.focus(), 250);
     f.onsubmit = e => {
       e.preventDefault();
@@ -675,6 +854,12 @@ function formPrevista(id) {
         priorita: (f.querySelector('[name=priorita]:checked') || {}).value || 'essenziale',
         inizio: f.inizio.value || '', fine: f.fine.value || '', note: f.note.value.trim(), attiva: f.attiva.checked
       };
+      data.bolletta = f.bolletta.checked;
+      data.rate = f.rate.checked;
+      data.numRate = data.rate ? (parseInt(f.numRate.value, 10) || 0) : 0;
+      if (data.rate && !data.fine) return toast("Indica l'ultima rata oppure le rate mancanti");
+      if (data.inizio && data.fine && data.inizio > data.fine) return toast("La prima rata è dopo l'ultima: controlla le date");
+      if (data.rate && data.inizio && data.frequenza !== 'mensile') data.meseRif = +data.inizio.slice(5, 7);
       data.autoConferma = data.metodo === 'addebito' && f.autoConferma.checked;
       if (data.autoConferma && !p.autoConferma) { const t = today(); data.autoDal = ymKey(t.y, t.m); data.autoSkip = []; }
       if (nuovo) S.previste.push(Object.assign({id: uid()}, data));
@@ -698,19 +883,20 @@ function formConferma(pid, periodo) {
   const p = S.previste.find(x => x.id === pid); if (!p) return;
   const mov = S.movimenti.find(x => x.tipo === 'prevista' && x.previstaId === pid && x.periodo === periodo);
   const [y, m] = periodo.split('-').map(Number);
-  const scad = `${periodo}-${pad(p.giorno ? Math.min(+p.giorno, dim(y, m)) : dim(y, m))}`;
-  const t = today(), defData = mov ? mov.data : (periodo === ymKey(t.y, t.m) ? isoToday() : scad);
+  const o = occDi(p, y, m), scad = o.scad;
+  const t = today(), defData = mov ? mov.data : o.ov ? (o.ov.data <= isoToday() ? o.ov.data : isoToday()) : (periodo === ymKey(t.y, t.m) ? isoToday() : scad);
   openSheet(mov ? 'Spesa confermata' : 'Conferma pagamento', `
   <form id="fc" autocomplete="off">
-    <div class="prev-top">${catIc(cat(p.categoriaId))}<div><div class="row-t">${h(p.voce)}</div><div class="row-s">${MESI[m - 1]} ${y} · previsto ${fmt(p.importo)}${p.tipo === 'variabile' ? ' (stima)' : ''}</div></div></div>
-    <div class="field"><label>Importo pagato</label><label class="big-amt"><span>€</span><input type="text" inputmode="decimal" name="importo" value="${numIn(mov ? mov.importo : p.importo)}" required></label>
-      ${p.tipo === 'variabile' ? '<small>Spesa variabile: inserisci l\'importo reale della bolletta.</small>' : ''}</div>
+    <div class="prev-top">${catIc(cat(p.categoriaId))}<div><div class="row-t">${h(p.voce)}</div><div class="row-s">${MESI[m - 1]} ${y} · ${o.ov ? `bolletta ${fmt(o.ov.importo)}, scad. ${fmtData(o.ov.data)}` : `previsto ${fmt(o.importo)}${p.tipo === 'variabile' || p.bolletta ? ' (stima)' : ''}`}</div></div></div>
+    <div class="field"><label>Importo pagato</label><label class="big-amt"><span>€</span><input type="text" inputmode="decimal" name="importo" value="${numIn(mov ? mov.importo : o.importo)}" required></label>
+      ${p.tipo === 'variabile' && !o.ov ? '<small>Spesa variabile: inserisci l\'importo reale.</small>' : ''}</div>
     <div class="grid2">
       <div class="field"><label for="fc-d">Data pagamento</label><input type="date" id="fc-d" name="data" value="${defData}" required></div>
       <div class="field"><label for="fc-m">Metodo</label><select id="fc-m" name="metodo">${optList(METODI, mov ? mov.metodo : p.metodo)}</select></div>
     </div>
     <div class="field"><label for="fc-n">Note</label><input type="text" id="fc-n" name="note" value="${h(mov ? mov.note || '' : '')}" placeholder="opzionale"></div>
     <div class="form-actions">${mov ? '<button type="button" class="btn danger" id="fc-undo">Annulla conferma</button>' : ''}<button class="btn" type="submit">${mov ? 'Salva' : '✓ Conferma'}</button></div>
+    ${p.bolletta ? `<button type="button" class="link" data-a="bolletta" data-id="${p.id}|${periodo}" style="align-self:center">📄 ${o.ov ? 'Modifica la bolletta' : 'Inserisci la bolletta'}</button>` : ''}
     <button type="button" class="link" id="fc-edit" style="align-self:center">Modifica la spesa prevista</button>
   </form>`, el => {
     const f = $('#fc', el);
@@ -730,6 +916,62 @@ function formConferma(pid, periodo) {
       save(); closeSheet(); render(); toast(p.autoConferma ? 'Conferma annullata: per questo mese non verrà riconfermata in automatico' : 'Conferma annullata');
     };
     $('#fc-edit', el).onclick = () => formPrevista(pid);
+  });
+}
+
+// ── Form: bolletta del mese (data e importo noti in anticipo)
+function linkGoogleCalendar(p, ov) {
+  const [hh, mm] = (S.imp.notifOra || '09:00').split(':').map(n => parseInt(n, 10) || 0);
+  const d = new Date(ov.data + 'T12:00:00Z'); if (S.imp.notifQuando === 'prima') d.setUTCDate(d.getUTCDate() - 1);
+  const ymd = d.toISOString().slice(0, 10).replace(/-/g, '');
+  const e = new Date(Date.UTC(2000, 0, 1, hh, mm + 15));
+  const end = e.getUTCDate() === 1 ? `${ymd}T${pad(e.getUTCHours())}${pad(e.getUTCMinutes())}00` : `${ymd}T235900`;
+  let tz = 'Europe/Rome'; try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || tz; } catch (x) {}
+  const q = new URLSearchParams({
+    action: 'TEMPLATE',
+    text: `💶 ${S.imp.notifQuando === 'prima' ? 'Domani scade' : 'Scade oggi'} ${p.voce} (${fmt(ov.importo)})`,
+    dates: `${ymd}T${pad(hh)}${pad(mm)}00/${end}`,
+    details: `Bolletta ${p.voce}: ${fmt(ov.importo)}, scadenza ${fmtData(ov.data)} · ${METODI[p.metodo] || ''}\nApri Spese di Casa per confermarla.`,
+    ctz: tz
+  });
+  return 'https://calendar.google.com/calendar/render?' + q.toString();
+}
+function formBolletta(pid, periodo) {
+  const p = S.previste.find(x => x.id === pid); if (!p) return;
+  const [y, m] = periodo.split('-').map(Number);
+  const o = occDi(p, y, m), ov = o.ov;
+  const giaPagata = confermataIn(p, periodo);
+  openSheet(`Bolletta ${p.voce}`, `<form id="fbl" autocomplete="off">
+    <div class="prev-top">${catIc(cat(p.categoriaId))}<div><div class="row-t">${h(p.voce)} · ${MESI[m - 1].toLowerCase()} ${y}</div><div class="row-s">Stima: ${fmt(o.stima)}${nStima(p) ? ` (media ultime ${nStima(p)})` : ''}</div></div></div>
+    <div class="field"><label>Importo della bolletta</label><label class="big-amt"><span>€</span><input type="text" inputmode="decimal" name="importo" value="${numIn(ov ? ov.importo : '')}" placeholder="${numIn(o.stima)}" required></label></div>
+    <div class="field"><label for="fbl-d">Data di scadenza</label><input type="date" id="fbl-d" name="data" value="${ov ? ov.data : ''}" required></div>
+    ${giaPagata ? '<div class="hint">Questa bolletta risulta già confermata: le modifiche qui non cambiano l\'importo pagato.</div>' : ''}
+    <div class="form-actions">${ov ? '<button type="button" class="btn danger" id="fbl-del">Rimuovi</button>' : ''}<button class="btn" type="submit">Salva bolletta</button></div>
+  </form>`, el => {
+    const f = $('#fbl', el);
+    if (!ov) setTimeout(() => f.importo.focus(), 250);
+    f.onsubmit = e => {
+      e.preventDefault();
+      const imp = num(f.importo.value);
+      if (imp <= 0) return toast('Inserisci l\'importo della bolletta');
+      if (!f.data.value) return toast('Inserisci la data di scadenza');
+      p.bollette = p.bollette || {};
+      p.bollette[periodo] = {data: f.data.value, importo: imp};
+      save();
+      const na = autoConferma();
+      render();
+      const nuovo = p.bollette[periodo];
+      const futura = nuovo.data >= isoToday() && !confermataIn(p, periodo);
+      openSheet('Bolletta salvata', `<div class="guide">
+        <p>📄 <b>${h(p.voce)}</b>: ${fmt(nuovo.importo)}, scadenza <b>${fmtData(nuovo.data)}</b>.</p>
+        ${futura ? `<p>Vuoi la notifica? Apri Google Calendar con il promemoria già compilato e premi <b>Salva</b>. Se te lo chiede, scegli il calendario <i>Scadenze spese</i>.</p>
+        <a class="btn block" style="display:block;text-align:center;text-decoration:none" href="${h(linkGoogleCalendar(p, nuovo))}" target="_blank" rel="noopener">📅 Aggiungi promemoria a Google Calendar</a>`
+          : na ? '<p>La scadenza è già passata ed era un addebito automatico: è stata confermata con l\'importo della bolletta.</p>' : ''}
+        <button class="btn ghost block" style="margin-top:10px" data-a="closeSheet">Fatto</button>
+      </div>`);
+    };
+    const d = $('#fbl-del', el);
+    if (d) d.onclick = () => { delete p.bollette[periodo]; save(); closeSheet(); render(); toast('Bolletta rimossa: torna la stima'); };
   });
 }
 
@@ -886,6 +1128,93 @@ function formBudgets() {
   });
 }
 
+// ───────────────────────── Notifiche tramite calendario (.ics) ─────────────────────────
+function firmaCalendario() {
+  const i = S.imp;
+  const base = S.previste.map(p => [p.id, p.voce, p.importo, p.giorno, p.frequenza, p.meseRif, p.inizio, p.fine, p.attiva, p.metodo, p.autoConferma, p.rate, p.numRate, p.bolletta].join('|')).sort().join('#')
+    + `#${i.notifOra}|${i.notifQuando}|${i.notifAuto}`;
+  let hsh = 5381; for (let k = 0; k < base.length; k++) hsh = ((hsh << 5) + hsh + base.charCodeAt(k)) | 0;
+  return String(hsh >>> 0);
+}
+function giorniCalendario() {
+  const t = today(), oggi = isoToday(), giorni = new Map();
+  for (let i = 0; i < 12; i++) {
+    const {y, m} = addMonths(t.y, t.m, i);
+    occorrenze(y, m).forEach(o => {
+      if (o.mov || o.attesa || o.scad < oggi) return;
+      if (!S.imp.notifAuto && isAuto(o.p)) return;
+      if (!giorni.has(o.scad)) giorni.set(o.scad, []);
+      giorni.get(o.scad).push(o);
+    });
+  }
+  return giorni;
+}
+function buildIcs() {
+  const esc = v => String(v).replace(/\\/g, '\\\\').replace(/;/g, '\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n');
+  const enc = new TextEncoder();
+  const fold = line => {
+    if (enc.encode(line).length <= 75) return line;
+    const parts = []; let cur = '', len = 0;
+    for (const ch of line) { const l = enc.encode(ch).length; if (len + l > (parts.length ? 74 : 75)) { parts.push(cur); cur = ''; len = 0; } cur += ch; len += l; }
+    parts.push(cur); return parts.join('\r\n ');
+  };
+  const [hh, mm] = (S.imp.notifOra || '09:00').split(':').map(n => parseInt(n, 10) || 0);
+  const prima = S.imp.notifQuando === 'prima';
+  const now = new Date(), stamp = now.toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+  const seq = Math.floor(now.getTime() / 60000) - 29000000;
+  const giorni = giorniCalendario();
+  const L = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Spese di Casa//IT', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'X-WR-CALNAME:Scadenze spese'];
+  [...giorni.keys()].sort().forEach(iso => {
+    const items = giorni.get(iso), tot = sum(items, o => o.importo);
+    const d = new Date(iso + 'T12:00:00Z'); if (prima) d.setUTCDate(d.getUTCDate() - 1);
+    const ymd = d.toISOString().slice(0, 10).replace(/-/g, '');
+    const quando = prima ? 'Domani' : 'Oggi';
+    const titolo = items.length === 1
+      ? `💶 ${quando} scade ${items[0].p.voce} (${fmt(items[0].importo)})`
+      : `💶 ${quando} ${items.length} scadenze: ${items.map(o => o.p.voce).join(', ')}`;
+    const righe = items.map(o => {
+      const r = o.p.rate ? numeroRata(o.p, o.periodo) : null;
+      return `• ${o.p.voce}: ${fmt(o.importo)}${o.ov ? ' (bolletta)' : o.p.tipo === 'variabile' ? ' (stima)' : ''} · ${METODI[o.p.metodo] || ''}${isAuto(o.p) ? ' · automatica' : ''}${r ? ` · rata ${r.n}/${r.tot}` : ''}`;
+    });
+    const desc = `Scadenze del ${fmtData(iso)}:\n${righe.join('\n')}${items.length > 1 ? `\nTotale: ${fmt(tot)}` : ''}\n\nApri Spese di Casa per confermarle.`;
+    const fine = new Date(Date.UTC(2000, 0, 1, hh, mm + 15));
+    L.push('BEGIN:VEVENT', `UID:scadenze-${iso.replace(/-/g, '')}@spese-di-casa`, `DTSTAMP:${stamp}`, `SEQUENCE:${seq}`,
+      `DTSTART:${ymd}T${pad(hh)}${pad(mm)}00`,
+      fine.getUTCDate() === 1 ? `DTEND:${ymd}T${pad(fine.getUTCHours())}${pad(fine.getUTCMinutes())}00` : 'DURATION:PT15M',
+      `SUMMARY:${esc(titolo)}`, `DESCRIPTION:${esc(desc)}`, 'TRANSP:TRANSPARENT',
+      'BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${esc(titolo)}`, 'TRIGGER:PT0M', 'END:VALARM', 'END:VEVENT');
+  });
+  L.push('END:VCALENDAR');
+  return {text: L.map(fold).join('\r\n') + '\r\n', n: giorni.size};
+}
+function exportIcs() {
+  const {text, n} = buildIcs();
+  if (!n) return toast('Nessuna scadenza nei prossimi 12 mesi');
+  S.imp.icsAt = isoToday(); S.imp.icsSig = firmaCalendario(); save();
+  offerFile(`scadenze-spese-${isoToday()}.ics`, text, 'text/calendar');
+  if (view === 'altro') setTimeout(() => { if (!sheetOpen) render(); }, 0);
+}
+function avvisoCalendario() {
+  const i = S.imp; if (!i.icsAt || !S.previste.length) return '';
+  const vecchio = daysBetween(i.icsAt, isoToday()) > 300;
+  if (!vecchio && i.icsSig === firmaCalendario()) return '';
+  return `<div class="tip warn"><span class="em">📅</span><div>${vecchio ? 'Il calendario delle notifiche sta per finire' : 'Hai modificato le spese previste o le notifiche'}: esporta di nuovo il calendario e reimportalo per avere le notifiche aggiornate. <button class="link" data-a="exportIcs">Esporta ora →</button></div></div>`;
+}
+function guidaCalendario() {
+  openSheet('Notifiche nel calendario', `<div class="guide">
+    <p>Le notifiche arrivano da Google Calendar, quindi funzionano anche ad app chiusa. La configurazione si fa <b>una volta sola, dal computer</b>: l'app Google Calendar per Android non importa i file .ics.</p>
+    <ol>
+      <li><b>Esporta</b> il file con il pulsante "Esporta calendario scadenze" e mandalo al computer, per esempio con Drive o per email.</li>
+      <li>Sul computer apri <b>calendar.google.com</b> → ⚙️ <b>Impostazioni</b> → <b>Aggiungi calendario</b> → <b>Crea nuovo calendario</b>. Chiamalo <i>Scadenze spese</i>.</li>
+      <li>Sempre nelle Impostazioni: <b>Importa ed esporta</b> → scegli il file .ics → come calendario seleziona <i>Scadenze spese</i> → <b>Importa</b>.</li>
+      <li>Apri le impostazioni del calendario <i>Scadenze spese</i> → <b>Notifiche evento</b> → aggiungi <b>Notifica · 0 minuti</b>. Serve perché Google ignora gli avvisi contenuti nel file.</li>
+      <li>Sul telefono, nell'app Google Calendar, controlla che <i>Scadenze spese</i> sia spuntato e che le notifiche dell'app siano attive.</li>
+    </ol>
+    <p><b>Aggiornare:</b> quando l'app te lo segnala, riesporta e reimporta nello <b>stesso</b> calendario: i giorni già presenti vengono aggiornati, non duplicati. Se togli una spesa, il vecchio promemoria resta: per ripulire del tutto elimina e ricrea il calendario <i>Scadenze spese</i> prima di importare.</p>
+    <p class="hint">Il file contiene le scadenze dei prossimi 12 mesi non ancora confermate, una notifica al giorno all'ora che hai scelto. Le bollette entrano solo dopo che le hai inserite: per quelle, quando le inserisci, l'app ti propone di aggiungere il promemoria con un tocco, senza riesportare.</p>
+  </div>`);
+}
+
 // ───────────────────────── Esportazione / importazione ─────────────────────────
 function offerFile(name, text, mime) {
   const blob = new Blob([text], {type: mime});
@@ -920,8 +1249,8 @@ const actionsExport = {
     offerFile(`spese-${k}.csv`, csvMovimenti(S.movimenti.filter(x => x.tipo === 'extra' ? x.data.startsWith(k) : x.periodo === k)), 'text/csv');
   },
   exportPrev: () => offerFile(`spese-previste-${isoToday()}.csv`, toCsv([
-    ['Voce', 'Categoria', 'Tipo', 'Frequenza', 'Importo per pagamento', 'Costo mensile equivalente', 'Costo annuo', 'Scadenza', 'Metodo', 'Priorità', 'Conferma automatica', 'Attiva', 'Dal', 'Fino al', 'Note'],
-    ...S.previste.map(p => [p.voce, cat(p.categoriaId).nome, TIPI[p.tipo], FREQ[p.frequenza].l, csvNum(p.importo), csvNum(mensileEq(p)), csvNum(annuo(p)), scadenzaTesto(p), METODI[p.metodo], PRIO[p.priorita], isAuto(p) ? 'Sì' : 'No', p.attiva === false ? 'No' : 'Sì', p.inizio || '', p.fine || '', p.note || ''])
+    ['Voce', 'Categoria', 'Tipo', 'Frequenza', 'Importo per pagamento', 'Costo mensile equivalente', 'Costo annuo', 'Scadenza', 'Metodo', 'Priorità', 'Conferma automatica', 'Rate totali', 'Rate mancanti', 'Debito residuo', 'Attiva', 'Dal', 'Fino al', 'Note'],
+    ...S.previste.map(p => [p.voce, cat(p.categoriaId).nome, TIPI[p.tipo], FREQ[p.frequenza].l, csvNum(p.importo), csvNum(mensileEq(p)), csvNum(annuo(p)), scadenzaTesto(p), METODI[p.metodo], PRIO[p.priorita], isAuto(p) ? 'Sì' : 'No', ...((r) => r ? [r.totali || '', r.mancanti, csvNum(r.residuo)] : ['', '', ''])(rateInfo(p)), p.attiva === false ? 'No' : 'Sì', p.inizio || '', p.fine || '', p.note || ''])
   ]), 'text/csv'),
   importJson: () => { const i = $('#import-file'); i.value = ''; i.click(); }
 };
@@ -949,8 +1278,8 @@ function seed() {
   S.previste = [
     P('Affitto', 'Casa', 'fissa_mensile', 'mensile', 650, 1, 1, 'bonifico', 'essenziale'),
     P('Spese condominiali', 'Casa', 'fissa_mensile', 'mensile', 55, 10, 1, 'bonifico', 'essenziale'),
-    P('Luce', 'Utenze', 'variabile', 'bimestrale', 78, 20, 1, 'addebito', 'essenziale'),
-    P('Gas', 'Utenze', 'variabile', 'bimestrale', 95, 25, 2, 'addebito', 'essenziale'),
+    P('Luce', 'Utenze', 'variabile', 'mensile', 55, 20, 1, 'addebito', 'essenziale', {bolletta: true}),
+    P('Gas', 'Utenze', 'variabile', 'mensile', 70, 25, 1, 'addebito', 'essenziale', {bolletta: true}),
     P('Acqua', 'Utenze', 'variabile', 'trimestrale', 48, 15, 3, 'addebito', 'essenziale'),
     P('TARI', 'Utenze', 'fissa_non_mensile', 'semestrale', 140, 16, 5, 'bonifico', 'essenziale'),
     P('Cellulare', 'Telefonia', 'fissa_mensile', 'mensile', 9.99, 5, 1, 'addebito', 'essenziale'),
@@ -960,7 +1289,8 @@ function seed() {
     P('Spazio cloud', 'Abbonamenti digitali', 'fissa_mensile', 'mensile', 2.99, 3, 1, 'addebito', 'utile'),
     P('Amazon Prime', 'Abbonamenti digitali', 'fissa_non_mensile', 'annuale', 49.9, 14, 3, 'addebito', 'tagliabile'),
     P('Bollo auto', 'Trasporti', 'fissa_non_mensile', 'annuale', 215, 30, 9, 'bonifico', 'essenziale'),
-    P('Rata auto', 'Finanziamenti e Rate', 'fissa_mensile', 'mensile', 210, 15, 1, 'addebito', 'essenziale', {fine: '2028-06'}),
+    P('Rata auto', 'Finanziamenti e Rate', 'fissa_mensile', 'mensile', 210, 15, 1, 'addebito', 'essenziale', {rate: true, numRate: 48, inizio: '2024-07', fine: '2028-06'}),
+    P('Lavatrice a rate', 'Finanziamenti e Rate', 'fissa_mensile', 'mensile', 45, 5, 1, 'addebito', 'utile', {rate: true, numRate: 12, inizio: '2026-04', fine: '2027-03'}),
     P('Palestra', 'Salute', 'fissa_mensile', 'mensile', 39, 1, 1, 'addebito', 'tagliabile'),
     P('RC Auto', 'Assicurazioni', 'fissa_non_mensile', 'annuale', 480, 10, 4, 'bonifico', 'essenziale'),
     P('Assicurazione casa', 'Assicurazioni', 'fissa_non_mensile', 'annuale', 180, 20, 2, 'addebito', 'utile')
@@ -977,10 +1307,16 @@ function seed() {
     ['Svago', 'Cinema', 10, 25, 1], ['Abbigliamento', 'Scarpe', 40, 90, 0.5], ['Cura personale', 'Parrucchiere', 18, 35, 1], ['Salute', 'Farmacia', 8, 30, 1.5], ['Regali', 'Regalo compleanno', 20, 50, 0.6]];
   for (let off = 5; off >= 0; off--) {
     const {y, m} = addMonths(t.y, t.m, -off), k = ymKey(y, m), last = off === 0 ? t.d : dim(y, m);
+    S.previste.filter(p => p.bolletta && dovuta(p, y, m)).forEach(p => {
+      if (off === 0 && p.voce !== 'Luce') return;  // il gas di questo mese resta "in attesa della bolletta"
+      const g = off === 0 ? Math.min(dim(y, m), t.d + 6) : 12 + Math.floor(rnd() * 14);
+      p.bollette = p.bollette || {};
+      p.bollette[k] = {data: `${k}-${pad(g)}`, importo: Math.round(p.importo * (0.75 + rnd() * 0.5) * 100) / 100};
+    });
     occorrenze(y, m).forEach(o => {
-      if (+o.scad.slice(8) > last) return;
-      let imp = o.p.importo;
-      if (o.p.tipo === 'variabile') imp = Math.round(imp * (0.82 + rnd() * 0.36) * 100) / 100;
+      if (o.attesa || o.scad > `${k}-${pad(last)}`) return;
+      let imp = o.importo;
+      if (o.p.tipo === 'variabile' && !o.ov) imp = Math.round(imp * (0.82 + rnd() * 0.36) * 100) / 100;
       S.movimenti.push({id: uid(), tipo: 'prevista', previstaId: o.p.id, periodo: k, data: o.scad, importo: imp, categoriaId: o.p.categoriaId, descrizione: o.p.voce, metodo: o.p.metodo, note: '', auto: !!o.p.autoConferma});
     });
     EX.forEach(([cn, desc, a, b, fr]) => {
@@ -1011,6 +1347,9 @@ const A = {
   editMov: (el, id) => formEditMov(id),
   addEnt: () => formEntrata(), editEnt: (el, id) => formEntrata(id),
   budgets: () => formBudgets(),
+  exportIcs: () => exportIcs(),
+  bolletta: (el, id) => { const [pid, per] = id.split('|'); formBolletta(pid, per); },
+  icsHelp: () => guidaCalendario(),
   autoAll: (el, id) => { const on = id === '1', k = ymKey(today().y, today().m);
     S.previste.forEach(p => { if (p.metodo !== 'addebito') return; if (on && !p.autoConferma) { p.autoDal = k; p.autoSkip = []; } p.autoConferma = on; });
     save(); if (!autoConferma()) toast(on ? 'Conferma automatica attivata' : 'Conferma automatica disattivata'); render(); },
@@ -1036,6 +1375,9 @@ document.addEventListener('change', e => {
   if (k === 'fCat') { fPrev.cat = el.value; render(); }
   else if (k === 'fPrio') { fPrev.prio = el.value; render(); }
   else if (k === 'budget') { S.imp.budgetExtra = num(el.value); save(); el.value = numIn(S.imp.budgetExtra || ''); toast('Budget salvato'); }
+  else if (k === 'notifOra') { if (/^\d{2}:\d{2}$/.test(el.value)) { S.imp.notifOra = el.value; save(); render(); toast('Ora salvata: riesporta il calendario'); } }
+  else if (k === 'notifQuando') { S.imp.notifQuando = el.value; save(); render(); }
+  else if (k === 'notifAuto') { S.imp.notifAuto = el.checked; save(); render(); }
   else if (k === 'auto') {
     const p = S.previste.find(x => x.id === el.dataset.id); if (!p) return;
     if (el.checked && !p.autoConferma) { p.autoDal = ymKey(today().y, today().m); p.autoSkip = []; }
