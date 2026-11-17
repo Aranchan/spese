@@ -47,15 +47,16 @@ const addMonths = (y, m, d) => { const t = y*12 + (m-1) + d; return {y: Math.flo
 function fresh() {
   return {
     v: 1,
-    categorie: DEFAULT_CATS.map((c, i) => ({id:'c'+(i+1), nome:c[0], icona:c[1], uso:c[2], colore:PALETTE[i % PALETTE.length]})),
+    categorie: DEFAULT_CATS.map((c, i) => ({id:'c'+(i+1), nome:c[0], icona:c[1], uso:c[2], colore:PALETTE[i % PALETTE.length], buoni: /spesa alimentare|ristoranti/i.test(c[0])})),
     previste: [], movimenti: [], entrate: [],
-    imp: {budgetExtra:0, preavviso:5, ultimaCat:'c10', mig11:true, mig12:true, notifOra:'09:00', notifQuando:'giorno', notifAuto:true, icsAt:'', icsSig:''}
+    buoni: {taglio: 0, ricariche: []},
+    imp: {budgetExtra:0, preavviso:5, ultimaCat:'c10', mig11:true, mig12:true, mig13:true, notifOra:'09:00', notifQuando:'giorno', notifAuto:true, icsAt:'', icsSig:''}
   };
 }
 function normalize(s) {
   const f = fresh();
   const out = Object.assign(f, s || {});
-  out.imp = Object.assign(fresh().imp, {mig11:false, mig12:false}, (s && s.imp) || {});
+  out.imp = Object.assign(fresh().imp, {mig11:false, mig12:false, mig13:false}, (s && s.imp) || {});
   // v1.1: categoria Carburante per chi aveva già dei dati
   if (!out.imp.mig11) {
     if (Array.isArray(out.categorie) && !out.categorie.some(c => (c.nome || '').toLowerCase() === 'carburante'))
@@ -67,6 +68,12 @@ function normalize(s) {
     const fin = (out.categorie || []).filter(c => /finanz|rate/i.test(c.nome || '')).map(c => c.id);
     (out.previste || []).forEach(p => { if (p.fine && fin.includes(p.categoriaId) && p.rate === undefined) p.rate = true; });
     out.imp.mig12 = true;
+  }
+  // v1.4: buoni pasto
+  if (!out.buoni || !Array.isArray(out.buoni.ricariche)) out.buoni = {taglio: (out.buoni && +out.buoni.taglio) || 0, ricariche: []};
+  if (!out.imp.mig13) {
+    (out.categorie || []).forEach(c => { if (c.buoni === undefined && /spesa alimentare|ristoranti/i.test(c.nome || '')) c.buoni = true; });
+    out.imp.mig13 = true;
   }
   ['categorie','previste','movimenti','entrate'].forEach(k => { if (!Array.isArray(out[k])) out[k] = k === 'categorie' ? fresh().categorie : []; });
   return out;
@@ -139,12 +146,33 @@ function confermeOrfane(y, m, occ) {
   const k = ymKey(y, m), ids = new Set(occ.map(o => o.mov && o.mov.id));
   return S.movimenti.filter(x => x.tipo === 'prevista' && x.periodo === k && !ids.has(x.id));
 }
+// ── Buoni pasto (v1.4): i buoni si consumano dal lotto più vecchio (FIFO)
+const cassa = x => Math.max(0, Math.round(((+x.importo || 0) - (+x.buoniValore || 0)) * 100) / 100);  // parte pagata con lo stipendio
+function lottiBuoni(escludiId) {
+  const lotti = S.buoni.ricariche.slice().sort((a, b) => (a.data || '').localeCompare(b.data || '')).map(r => ({taglio: +r.taglio || 0, n: +r.numero || 0}));
+  let usati = sum(S.movimenti.filter(x => +x.buoni > 0 && x.id !== escludiId), x => +x.buoni);
+  for (const l of lotti) { const k = Math.min(l.n, usati); l.n -= k; usati -= k; }
+  return lotti.filter(l => l.n > 0);
+}
+function saldoBuoni(escludiId) {
+  const l = lottiBuoni(escludiId);
+  return {n: sum(l, x => x.n), valore: Math.round(sum(l, x => x.n * x.taglio) * 100) / 100, tagli: [...new Set(l.map(x => x.taglio))], primo: l.length ? l[0].taglio : (+S.buoni.taglio || 0)};
+}
+function valoreBuoni(k, escludiId) {
+  let v = 0;
+  for (const l of lottiBuoni(escludiId)) { const q = Math.min(l.n, k); v += q * l.taglio; k -= q; if (!k) break; }
+  return Math.round(v * 100) / 100;
+}
+const testoSaldoBuoni = sb => sb.tagli.length === 1 ? `${sb.n} × ${fmt(sb.tagli[0])} = ${fmt(sb.valore)}` : `${sb.n} buoni · ${fmt(sb.valore)}`;
+const haBuoni = () => S.buoni.ricariche.length > 0;
+
 // Budget per categoria: conta extra + previste confermate del mese
 function spesoCategoria(cid, y, m) {
   const k = ymKey(y, m);
-  const speso = sum(S.movimenti.filter(x => x.categoriaId === cid && (x.tipo === 'extra' ? (x.data || '').startsWith(k) : x.periodo === k)), x => x.importo);
+  const movs = S.movimenti.filter(x => x.categoriaId === cid && (x.tipo === 'extra' ? (x.data || '').startsWith(k) : x.periodo === k));
+  const speso = sum(movs, cassa), inBuoni = sum(movs, x => +x.buoniValore || 0);
   const daConf = sum(occorrenze(y, m).filter(o => !o.mov && o.p.categoriaId === cid), o => o.importo);
-  return {speso, daConf};
+  return {speso, daConf, inBuoni};
 }
 function mediaCategoria(cid, mesi) {
   const t = today(); let tot = 0;
@@ -192,9 +220,9 @@ function datiMese(y, m) {
   const ex = extraMese(k);
   const totOk = sum(ok, o => o.mov.importo) + sum(orf, x => x.importo);
   const totDa = sum(da, o => o.importo);
-  const totEx = sum(ex, x => x.importo);
+  const totEx = sum(ex, cassa), exBuoni = sum(ex, x => +x.buoniValore || 0), nBuoni = sum(ex, x => +x.buoni || 0);
   const ent = entrateMese(m);
-  return {k, occ, da, ok, orf, ex, totOk, totDa, totEx, ent, pagato: totOk + totEx, resto: ent - totOk - totEx - totDa};
+  return {k, occ, da, ok, orf, ex, totOk, totDa, totEx, exBuoni, nBuoni, ent, pagato: totOk + totEx, resto: ent - totOk - totEx - totDa};
 }
 
 // ───────────────────────── Vista corrente ─────────────────────────
@@ -312,8 +340,8 @@ function rowMov(x) {
   return `<div class="row tap" data-a="editMov" data-id="${x.id}">
     ${catIc(c)}
     <div class="row-main"><div class="row-t">${h(x.descrizione || c.nome)}</div>
-      <div class="row-s"><span>${fmtData(x.data)} · ${h(c.nome)}${x.metodo ? ' · ' + METODI[x.metodo] : ''}</span></div></div>
-    <div class="amt">${fmt(x.importo)}</div>
+      <div class="row-s"><span>${fmtData(x.data)} · ${h(c.nome)}${x.metodo && cassa(x) > 0 ? ' · ' + METODI[x.metodo] : ''}</span>${+x.buoni ? `<span class="pill ok">🍽️ ${x.buoni} ${+x.buoni === 1 ? 'buono' : 'buoni'}</span>` : ''}</div></div>
+    <div class="amt">${fmt(x.importo)}${+x.buoni ? `<small>${cassa(x) > 0 ? fmt(cassa(x)) + ' in denaro' : 'tutto in buoni'}</small>` : ''}</div>
   </div>`;
 }
 
@@ -330,7 +358,7 @@ function budgetCategorie(y, m, conTitolo) {
       return `<div class="bud">
         <div class="kv"><span>${h(r.c.icona)} ${h(r.c.nome)}</span><b class="small${over ? ' neg' : ''}">${fmt(r.speso)} <span class="muted" style="font-weight:500">/ ${fmt(r.b)}</span></b></div>
         <div style="margin:7px 0 5px">${bar(pct, col)}</div>
-        <div class="row-s">${over ? `<span class="pill danger">Superato di ${fmt(-rest)}</span>` : `<span class="pill${pct >= 80 ? ' warn' : ''}">Restano ${fmt(rest)}</span>`}${r.daConf ? `<span>${fmt(r.daConf)} di spese previste ancora da pagare</span>` : ''}${sfora ? '<span class="pill warn">Con le previste sforerai</span>' : ''}</div>
+        <div class="row-s">${over ? `<span class="pill danger">Superato di ${fmt(-rest)}</span>` : `<span class="pill${pct >= 80 ? ' warn' : ''}">Restano ${fmt(rest)}</span>`}${r.inBuoni ? `<span>+ ${fmt(r.inBuoni)} in buoni pasto</span>` : ''}${r.daConf ? `<span>${fmt(r.daConf)} di spese previste ancora da pagare</span>` : ''}${sfora ? '<span class="pill warn">Con le previste sforerai</span>' : ''}</div>
       </div>`;
     }).join('')}</div>
   </section>`;
@@ -352,13 +380,14 @@ function vMese() {
       <div><span>Già speso</span><b>${fmt(d.pagato)}</b></div>
       <div><span>Ancora da pagare</span><b>${fmt(d.totDa)}</b></div>
     </div>
+    ${haBuoni() ? (sb => `<button class="hero-buoni" data-a="buoni"><span>🍽️ Buoni pasto restanti</span><b>${testoSaldoBuoni(sb)}</b></button>`)(saldoBuoni()) : ''}
     ${d.ent ? '' : `<button class="link" data-a="nav" data-id="altro">Aggiungi le entrate per vedere quanto ti resta →</button>`}
   </section>
 
   ${b ? `<section class="card">
     <div class="kv"><span class="small muted">Budget spese extra</span><b class="small">${fmt(d.totEx)} / ${fmt(b)}</b></div>
     <div style="margin-top:10px">${bar(d.totEx / b * 100, null, d.totEx > b)}</div>
-    <div class="hint" style="margin-top:8px">${d.totEx > b ? `Hai superato il budget di <b>${fmt(d.totEx - b)}</b>.` : `Puoi ancora spendere <b>${fmt(b - d.totEx)}</b> in extra questo mese.`}</div>
+    <div class="hint" style="margin-top:8px">${d.totEx > b ? `Hai superato il budget di <b>${fmt(d.totEx - b)}</b>.` : `Puoi ancora spendere <b>${fmt(b - d.totEx)}</b> in extra questo mese.`}${d.exBuoni ? ` Conta solo la parte pagata in denaro: altri ${fmt(d.exBuoni)} sono stati pagati con ${d.nBuoni} buoni pasto.` : ''}</div>
   </section>` : ''}
 
   ${(() => { const att = d.da.filter(o => o.attesa); if (!att.length) return '';
@@ -563,7 +592,8 @@ function vReport() {
   const nTot = d.occ.length, nOk = d.ok.length;
   const prevOk = sum(d.ok, o => o.stima), effOk = sum(d.ok, o => o.mov.importo), scost = effOk - prevOk;
   const diffs = d.ok.filter(o => Math.abs(o.mov.importo - o.stima) >= 0.01).sort((a, b) => Math.abs(b.mov.importo - b.stima) - Math.abs(a.mov.importo - a.stima));
-  const exG = S.categorie.map(c => { const it = d.ex.filter(x => x.categoriaId === c.id); return {c, n: it.length, t: sum(it, x => x.importo)}; }).filter(g => g.n).sort((a, b) => b.t - a.t);
+  const exG = S.categorie.map(c => { const it = d.ex.filter(x => x.categoriaId === c.id); return {c, n: it.length, t: sum(it, x => x.importo), bv: sum(it, x => +x.buoniValore || 0)}; }).filter(g => g.n).sort((a, b) => b.t - a.t);
+  const sb = saldoBuoni(), ricMese = S.buoni.ricariche.filter(r => (r.data || '').startsWith(d.k));
 
   // andamento ultimi 6 mesi
   const trend = [5, 4, 3, 2, 1, 0].map(i => { const x = addMonths(cur.y, cur.m, -i); const dd = datiMese(x.y, x.m); return {x, f: dd.totOk, e: dd.totEx}; });
@@ -589,13 +619,23 @@ function vReport() {
   </section>` : ''}
 
   <section>
-    <div class="sec-h"><h2>Spese extra</h2><span class="muted small">${d.ex.length} spese · ${fmt(d.totEx)}</span></div>
+    <div class="sec-h"><h2>Spese extra</h2><span class="muted small">${d.ex.length} spese · ${fmt(d.totEx + d.exBuoni)}</span></div>
     <div class="card">
-      ${b ? `<div class="kv small"><span class="muted">Budget</span><b>${fmt(d.totEx)} / ${fmt(b)}</b></div><div style="margin:8px 0 16px">${bar(d.totEx / b * 100, null, d.totEx > b)}</div>` : ''}
-      ${exG.length ? exG.map(g => `<div style="margin-bottom:12px"><div class="kv"><span>${h(g.c.icona)} ${h(g.c.nome)} <span class="muted small">× ${g.n}</span></span><b>${fmt(g.t)}</b></div><div style="margin-top:6px">${bar(g.t / exG[0].t * 100, g.c.colore)}</div></div>`).join('')
+      ${d.exBuoni ? `<div class="kv small" style="margin-bottom:10px"><span class="muted">In denaro ${fmt(d.totEx)} · in buoni ${fmt(d.exBuoni)}</span><span></span></div>` : ''}
+      ${b ? `<div class="kv small"><span class="muted">Budget (solo denaro)</span><b>${fmt(d.totEx)} / ${fmt(b)}</b></div><div style="margin:8px 0 16px">${bar(d.totEx / b * 100, null, d.totEx > b)}</div>` : ''}
+      ${exG.length ? exG.map(g => `<div style="margin-bottom:12px"><div class="kv"><span>${h(g.c.icona)} ${h(g.c.nome)} <span class="muted small">× ${g.n}</span></span><b>${fmt(g.t)}${g.bv ? ` <span class="muted small" style="font-weight:500">(${fmt(g.bv)} in buoni)</span>` : ''}</b></div><div style="margin-top:6px">${bar(g.t / exG[0].t * 100, g.c.colore)}</div></div>`).join('')
         : '<div class="empty-s" style="padding:6px">Nessuna spesa extra in questo mese.</div>'}
     </div>
   </section>
+
+  ${haBuoni() ? `<section>
+    <div class="sec-h"><h2>🍽️ Buoni pasto</h2><button class="link" data-a="buoni">Dettagli</button></div>
+    <div class="card">
+      <div class="kv"><span>Usati nel mese</span><b>${d.nBuoni} · ${fmt(d.exBuoni)}</b></div>
+      <div class="kv"><span>Ricaricati nel mese</span><b>${sum(ricMese, r => +r.numero)} · ${fmt(sum(ricMese, r => r.numero * r.taglio))}</b></div>
+      <div class="kv total"><span>Restanti oggi</span><b style="color:var(--accent)">${testoSaldoBuoni(sb)}</b></div>
+    </div>
+  </section>` : ''}
 
   ${budgetCategorie(cur.y, cur.m)}
 
@@ -604,9 +644,10 @@ function vReport() {
     <div class="card">
       <div class="kv"><span>Entrate</span><b>${fmt(d.ent)}</b></div>
       <div class="kv"><span>Spese previste confermate</span><b>− ${fmt(d.totOk)}</b></div>
-      <div class="kv"><span>Spese extra</span><b>− ${fmt(d.totEx)}</b></div>
+      <div class="kv"><span>Spese extra${d.exBuoni ? ' (in denaro)' : ''}</span><b>− ${fmt(d.totEx)}</b></div>
       <div class="kv"><span class="muted">Ancora da pagare (stima)</span><b class="muted">− ${fmt(d.totDa)}</b></div>
       <div class="kv total"><span>Saldo previsto</span><b style="color:${d.resto < 0 ? 'var(--danger)' : 'var(--accent)'}">${fmt(d.resto)}</b></div>
+      ${haBuoni() ? `<div class="kv" style="margin-top:10px"><span class="muted">🍽️ A parte: buoni pasto restanti</span><b>${fmt(sb.valore)}</b></div>` : ''}
     </div>
   </section>
 
@@ -633,6 +674,15 @@ function vAltro() {
     <div class="sec-h"><h2>Entrate</h2><button class="link" data-a="addEnt">+ Aggiungi</button></div>
     <div class="list">${ent.map(e => `<div class="row tap" data-a="editEnt" data-id="${e.id}"><span class="cat-ic" style="--c:#2f7d5b">💶</span><div class="row-main"><div class="row-t">${h(e.voce)}</div><div class="row-s">${+e.mese ? 'Ogni anno a ' + MESI[e.mese - 1].toLowerCase() : 'Ogni mese'}</div></div><div class="amt">${fmt(e.importo)}</div></div>`).join('')
       || '<div class="empty-s">Aggiungi stipendio e altre entrate per sapere quanto ti resta ogni mese.</div>'}</div>
+  </section>
+
+  <section>
+    <div class="sec-h"><h2>🍽️ Buoni pasto</h2>${haBuoni() ? '<button class="link" data-a="buoni">Storico</button>' : ''}</div>
+    ${haBuoni() ? (sb => `<div class="card buoni-card">
+      <div><div class="muted small">Restanti</div><div class="buoni-big">${sb.n} <span class="muted" style="font-size:1rem;font-weight:600">buoni</span></div><div class="small muted">${sb.tagli.length === 1 ? `da ${fmt(sb.tagli[0])} · ` : ''}valore ${fmt(sb.valore)}</div></div>
+      <button class="btn" data-a="ricarica">+ Ricarica</button>
+    </div>`)(saldoBuoni()) : `<div class="list"><div class="empty-s">Se ricevi buoni pasto, inserisci la prima ricarica: potrai usarli nelle spese delle categorie abilitate.<br><button class="link" style="margin-top:8px" data-a="ricarica">+ Prima ricarica</button></div></div>`}
+    <div class="hint">Categorie dove si possono usare: ${S.categorie.filter(c => c.buoni).map(c => h(c.icona + ' ' + c.nome)).join(', ') || 'nessuna'}. Puoi cambiarle da Categorie qui sotto.</div>
   </section>
 
   <section>
@@ -672,7 +722,7 @@ function vAltro() {
 
   <section>
     <div class="sec-h"><h2>Categorie</h2><button class="link" data-a="addCat">+ Aggiungi</button></div>
-    <div class="list">${S.categorie.map(c => `<div class="row tap" data-a="editCat" data-id="${c.id}">${catIc(c, 1)}<div class="row-main"><div class="row-t">${h(c.nome)}</div><div class="row-s">${c.uso === 'fissa' ? 'Spese previste' : c.uso === 'extra' ? 'Spese extra' : 'Previste ed extra'}${+c.budget > 0 ? ' · budget ' + fmt(c.budget) : ''}</div></div><span class="muted">›</span></div>`).join('')}</div>
+    <div class="list">${S.categorie.map(c => `<div class="row tap" data-a="editCat" data-id="${c.id}">${catIc(c, 1)}<div class="row-main"><div class="row-t">${h(c.nome)}</div><div class="row-s">${c.uso === 'fissa' ? 'Spese previste' : c.uso === 'extra' ? 'Spese extra' : 'Previste ed extra'}${+c.budget > 0 ? ' · budget ' + fmt(c.budget) : ''}${c.buoni ? ' · 🍽️ buoni pasto' : ''}</div></div><span class="muted">›</span></div>`).join('')}</div>
   </section>
 
   <section>
@@ -690,7 +740,7 @@ function vAltro() {
       <div class="set-row tap" data-a="seed"><div><div class="row-t">Carica dati di esempio</div><div class="row-s">Sostituisce i dati attuali</div></div><span class="muted">›</span></div>
       <div class="set-row tap" data-a="reset"><div><div class="row-t" style="color:var(--danger)">Cancella tutti i dati</div><div class="row-s">Operazione non reversibile</div></div><span class="muted">›</span></div>
     </div>
-    <div class="hint" style="text-align:center">Spese di Casa · v1.3 · ${S.previste.length} previste · ${S.movimenti.length} movimenti</div>
+    <div class="hint" style="text-align:center">Spese di Casa · v1.4 · ${S.previste.length} previste · ${S.movimenti.length} movimenti</div>
   </section>`;
 }
 
@@ -993,6 +1043,12 @@ function extraFormHtml(x) {
   const sugg = [...new Set(S.movimenti.filter(m => m.tipo === 'extra' && m.descrizione).map(m => m.descrizione))].slice(-60);
   return `<form id="fx" autocomplete="off">
     <label class="big-amt"><span>€</span><input type="text" inputmode="decimal" name="importo" value="${numIn(x.importo)}" placeholder="0,00" required aria-label="Importo"></label>
+    <div class="buoni-box" id="fx-buoni" hidden>
+      <div class="kv"><span>🍽️ <b>Buoni pasto usati</b><br><small class="muted" id="fx-bdisp"></small></span>
+        <div class="stepper"><button type="button" data-st="-1" aria-label="Un buono in meno">−</button><input type="number" inputmode="numeric" min="0" name="buoni" value="${+x.buoni || 0}" aria-label="Numero di buoni"><button type="button" data-st="1" aria-label="Un buono in più">+</button></div></div>
+      <div class="buoni-calc" id="fx-bcalc"></div>
+      <button type="button" class="link" id="fx-sugg-b" hidden></button>
+    </div>
     <div class="field"><span class="flabel">Categoria</span><div class="chips">${cats.map(c => `<label class="chip"><input type="radio" name="categoriaId" value="${c.id}"${c.id === x.categoriaId ? ' checked' : ''}><span>${h(c.icona)} ${h(c.nome)}</span></label>`).join('')}</div></div>
     <div class="field"><label for="fx-desc">Descrizione</label><input type="text" id="fx-desc" name="descrizione" list="fx-sugg" value="${h(x.descrizione || '')}" placeholder="es. Supermercato"><datalist id="fx-sugg">${sugg.map(s => `<option value="${h(s)}">`).join('')}</datalist></div>
     <div class="grid2">
@@ -1010,6 +1066,35 @@ function defaultExtraDate() {
 function mountExtra(el, x) {
   const f = $('#fx', el);
   if (!x) setTimeout(() => f.importo.focus(), 250);
+  // ── buoni pasto: visibili solo per le categorie abilitate
+  const exId = x && x.id;
+  const box = $('#fx-buoni', el), nb = f.elements.buoni, bcalc = $('#fx-bcalc', el);
+  const catSel = () => (f.querySelector('[name=categoriaId]:checked') || {}).value;
+  const updBuoni = () => {
+    const sb = saldoBuoni(exId), cc = cat(catSel());
+    const usabile = cc.buoni && (sb.n > 0 || +nb.value > 0) && (!x || x.tipo === 'extra');
+    box.hidden = !usabile;
+    if (!usabile) return;
+    let n = Math.max(0, parseInt(nb.value, 10) || 0);
+    if (n > sb.n) { n = sb.n; nb.value = n; }
+    const tot = num(f.importo.value), val = valoreBuoni(n, exId), den = Math.max(0, Math.round((tot - val) * 100) / 100);
+    $('#fx-bdisp', el).textContent = `Disponibili: ${testoSaldoBuoni(sb)}`;
+    const sugg = sb.primo ? Math.min(sb.n, Math.floor((tot + 0.001) / sb.primo)) : 0;
+    let html = '';
+    if (n > 0) {
+      html = `<div class="kv"><span>${n} ${n === 1 ? 'buono' : 'buoni'}</span><b>− ${fmt(val)}</b></div>`
+        + `<div class="kv"><span>Da pagare in denaro</span><b class="${den > 0 ? '' : 'ok-t'}">${fmt(den)}</b></div>`;
+      if (tot > 0 && val > tot + 0.004) html += `<div class="pill warn" style="margin-top:6px">I buoni superano la spesa di ${fmt(val - tot)}: il resto non viene restituito</div>`;
+    } else html = `<div class="muted small">Nessun buono: pagherai tutto in denaro.</div>`;
+    bcalc.innerHTML = html;
+    sbtn.hidden = !(sugg > 0 && sugg !== n);
+    sbtn.dataset.n = sugg;
+    sbtn.textContent = `Usa ${sugg} ${sugg === 1 ? 'buono' : 'buoni'} (${fmt(valoreBuoni(sugg, exId))})`;
+  };
+  const sbtn = $('#fx-sugg-b', el);
+  sbtn.onclick = () => { nb.value = sbtn.dataset.n; updBuoni(); };
+  el.querySelectorAll('[data-st]').forEach(b => b.onclick = () => { nb.value = Math.max(0, (parseInt(nb.value, 10) || 0) + +b.dataset.st); updBuoni(); });
+  f.addEventListener('input', updBuoni); f.addEventListener('change', updBuoni); updBuoni();
   f.onsubmit = e => {
     e.preventDefault();
     const imp = num(f.importo.value);
@@ -1017,6 +1102,9 @@ function mountExtra(el, x) {
     const c = (f.querySelector('[name=categoriaId]:checked') || {}).value;
     if (!c) return toast('Scegli una categoria');
     const data = {importo: imp, categoriaId: c, descrizione: f.descrizione.value.trim(), data: f.data.value || isoToday(), metodo: f.metodo.value};
+    const nB = !box.hidden ? Math.max(0, parseInt(nb.value, 10) || 0) : 0;
+    if (nB > saldoBuoni(exId).n) return toast('Non hai abbastanza buoni pasto');
+    data.buoni = nB; data.buoniValore = nB ? valoreBuoni(nB, exId) : 0;
     if (x) Object.assign(x, data);
     else S.movimenti.push(Object.assign({id: uid(), tipo: 'extra', note: ''}, data));
     S.imp.ultimaCat = c;
@@ -1065,6 +1153,63 @@ function formEditMov(id) {
   openSheet('Modifica spesa', extraFormHtml(x), el => mountExtra(el, x));
 }
 
+// ── Buoni pasto: ricarica e storico
+function formRicarica(id) {
+  const r0 = S.buoni.ricariche.find(r => r.id === id);
+  const ultima = S.buoni.ricariche.slice().sort((a, b) => (b.data || '').localeCompare(a.data || ''))[0];
+  const r = r0 || {numero: ultima ? ultima.numero : '', taglio: +S.buoni.taglio || (ultima ? ultima.taglio : ''), data: isoToday(), note: ''};
+  openSheet(r0 ? 'Modifica ricarica' : 'Ricarica buoni pasto', `<form id="fr" autocomplete="off">
+    <div class="grid2">
+      <div class="field"><label for="fr-n">Numero di buoni</label><input type="number" inputmode="numeric" min="1" id="fr-n" name="numero" value="${r.numero || ''}" placeholder="es. 20" required></div>
+      <div class="field"><label for="fr-t">Taglio</label><input type="text" inputmode="decimal" id="fr-t" name="taglio" value="${numIn(r.taglio)}" placeholder="es. 6,20" required></div>
+    </div>
+    <div class="calc"><div><span>Valore ricarica</span><b id="fr-val">—</b></div><div><span>Dopo la ricarica</span><b id="fr-dopo">—</b></div></div>
+    <div class="field"><label for="fr-d">Data</label><input type="date" id="fr-d" name="data" value="${h(r.data)}" required></div>
+    <div class="field"><label for="fr-no">Note</label><input type="text" id="fr-no" name="note" value="${h(r.note || '')}" placeholder="es. ricarica di novembre"></div>
+    <div class="form-actions">${r0 ? '<button type="button" class="btn danger" id="fr-del">Elimina</button>' : ''}<button class="btn" type="submit">${r0 ? 'Salva' : 'Ricarica'}</button></div>
+  </form>`, el => {
+    const f = $('#fr', el);
+    const upd = () => {
+      const n = parseInt(f.numero.value, 10) || 0, t = num(f.taglio.value), sb = saldoBuoni();
+      const prima = r0 ? sb.n - (+r0.numero) : sb.n, primaV = r0 ? sb.valore - r0.numero * r0.taglio : sb.valore;
+      $('#fr-val', el).textContent = n && t ? fmt(n * t) : '—';
+      $('#fr-dopo', el).textContent = n && t ? `${prima + n} · ${fmt(primaV + n * t)}` : '—';
+    };
+    f.addEventListener('input', upd); upd();
+    if (!r0) setTimeout(() => f.numero.focus(), 250);
+    f.onsubmit = e => {
+      e.preventDefault();
+      const n = parseInt(f.numero.value, 10) || 0, t = num(f.taglio.value);
+      if (n <= 0 || t <= 0) return toast('Inserisci numero e taglio dei buoni');
+      const data = {numero: n, taglio: t, data: f.data.value || isoToday(), note: f.note.value.trim()};
+      if (r0) {
+        const usati = sum(S.movimenti, x => +x.buoni || 0), tot = sum(S.buoni.ricariche.filter(x => x !== r0), x => +x.numero) + n;
+        if (tot < usati) return toast(`Hai già usato ${usati} buoni: la ricarica non può essere più piccola`);
+        Object.assign(r0, data);
+      } else S.buoni.ricariche.push(Object.assign({id: uid()}, data));
+      S.buoni.taglio = t;
+      save(); closeSheet(); render(); toast(r0 ? 'Ricarica aggiornata' : `🍽️ Ricaricati ${n} buoni (${fmt(n * t)})`);
+    };
+    const d = $('#fr-del', el);
+    if (d) d.onclick = () => {
+      const usati = sum(S.movimenti, x => +x.buoni || 0), tot = sum(S.buoni.ricariche.filter(x => x !== r0), x => +x.numero);
+      if (tot < usati) return toast(`Non puoi eliminarla: hai già usato ${usati} buoni`);
+      askConfirm(`Eliminare la ricarica di <b>${r0.numero} buoni</b> del ${fmtData(r0.data)}?`, 'Elimina', () => { S.buoni.ricariche = S.buoni.ricariche.filter(x => x !== r0); save(); render(); toast('Ricarica eliminata'); }, true);
+    };
+  });
+}
+function sheetBuoni() {
+  const sb = saldoBuoni();
+  const ric = S.buoni.ricariche.slice().sort((a, b) => (b.data || '').localeCompare(a.data || ''));
+  const usi = S.movimenti.filter(x => +x.buoni > 0).sort((a, b) => b.data.localeCompare(a.data)).slice(0, 30);
+  openSheet('Buoni pasto', `
+    <div class="card buoni-card" style="margin-bottom:16px"><div><div class="muted small">Restanti</div><div class="buoni-big">${sb.n} <span class="muted" style="font-size:1rem;font-weight:600">buoni</span></div><div class="small muted">valore ${fmt(sb.valore)}</div></div><button class="btn" data-a="ricarica">+ Ricarica</button></div>
+    <div class="sec-h" style="margin-bottom:8px"><h2>Ricariche</h2></div>
+    <div class="list" style="margin-bottom:16px">${ric.map(r => `<div class="row tap" data-a="editRicarica" data-id="${r.id}"><span class="cat-ic sm" style="--c:#2f7d5b">➕</span><div class="row-main"><div class="row-t">${r.numero} buoni da ${fmt(r.taglio)}</div><div class="row-s">${fmtData(r.data)}${r.note ? ' · ' + h(r.note) : ''}</div></div><div class="amt">${fmt(r.numero * r.taglio)}</div></div>`).join('') || '<div class="empty-s">Nessuna ricarica.</div>'}</div>
+    <div class="sec-h" style="margin-bottom:8px"><h2>Ultimi utilizzi</h2></div>
+    <div class="list">${usi.map(x => `<div class="row tap" data-a="editMov" data-id="${x.id}">${catIc(cat(x.categoriaId), 1)}<div class="row-main"><div class="row-t">${h(x.descrizione || cat(x.categoriaId).nome)}</div><div class="row-s">${fmtData(x.data)} · spesa ${fmt(x.importo)}${cassa(x) ? ` · ${fmt(cassa(x))} in denaro` : ''}</div></div><div class="amt">−${x.buoni}<small>${fmt(x.buoniValore)}</small></div></div>`).join('') || '<div class="empty-s">Nessun buono usato finora.</div>'}</div>`);
+}
+
 // ── Form: entrate
 function formEntrata(id) {
   const e0 = S.entrate.find(x => x.id === id) || {voce: '', importo: '', mese: 0};
@@ -1099,6 +1244,7 @@ function formCategoria(id) {
       <div class="field"><label for="fk-c">Colore</label><input type="color" id="fk-c" name="colore" value="${h(c.colore)}"></div>
     </div>
     <div class="field"><label for="fk-b">Budget mensile <span style="text-transform:none;font-weight:500">(opz.)</span></label><input type="text" inputmode="decimal" id="fk-b" name="budget" value="${numIn(c.budget || '')}" placeholder="nessun budget"><small>Conta tutte le spese del mese in questa categoria: extra e previste confermate.</small></div>
+    <label class="switch"><span>🍽️ Si possono usare i buoni pasto</span><input type="checkbox" name="buoni"${c.buoni ? ' checked' : ''}></label>
     <div class="field"><label for="fk-u">Usata per</label><select id="fk-u" name="uso">${optList({fissa: 'Spese previste', extra: 'Spese extra', entrambe: 'Previste ed extra'}, c.uso)}</select></div>
     <div class="form-actions">${id ? `<button type="button" class="btn danger" id="fk-del"${usata ? ' disabled title="Categoria in uso"' : ''}>Elimina</button>` : ''}<button class="btn" type="submit">Salva</button></div>
     ${usata ? '<div class="hint">La categoria è usata da alcune voci: non può essere eliminata, ma puoi rinominarla.</div>' : ''}
@@ -1107,7 +1253,7 @@ function formCategoria(id) {
     f.onsubmit = ev => {
       ev.preventDefault();
       if (!f.nome.value.trim()) return toast('Inserisci un nome');
-      const data = {nome: f.nome.value.trim(), icona: f.icona.value.trim() || '📦', colore: f.colore.value, uso: f.uso.value, budget: num(f.budget.value) || 0};
+      const data = {nome: f.nome.value.trim(), icona: f.icona.value.trim() || '📦', colore: f.colore.value, uso: f.uso.value, budget: num(f.budget.value) || 0, buoni: f.buoni.checked};
       if (id) Object.assign(S.categorie.find(x => x.id === id), data); else S.categorie.push(Object.assign({id: 'c' + uid()}, data));
       save(); closeSheet(); render(); toast('Categoria salvata');
     };
@@ -1238,8 +1384,8 @@ const csvCell = v => { const s = String(v ?? ''); return /[;"\n]/.test(s) ? `"${
 const csvNum = v => (Math.round((+v || 0) * 100) / 100).toFixed(2).replace('.', ',');
 const toCsv = rows => '﻿' + rows.map(r => r.map(csvCell).join(';')).join('\r\n');
 function csvMovimenti(list) {
-  return toCsv([['Data', 'Tipo', 'Categoria', 'Descrizione', 'Importo', 'Metodo', 'Periodo di riferimento', 'Note'],
-    ...list.slice().sort((a, b) => a.data.localeCompare(b.data)).map(x => [x.data, x.tipo === 'extra' ? 'Extra' : 'Prevista', cat(x.categoriaId).nome, x.descrizione || '', csvNum(x.importo), METODI[x.metodo] || '', x.periodo || '', x.note || ''])]);
+  return toCsv([['Data', 'Tipo', 'Categoria', 'Descrizione', 'Importo', 'Buoni pasto', 'Valore buoni', 'Pagato in denaro', 'Metodo', 'Periodo di riferimento', 'Note'],
+    ...list.slice().sort((a, b) => a.data.localeCompare(b.data)).map(x => [x.data, x.tipo === 'extra' ? 'Extra' : 'Prevista', cat(x.categoriaId).nome, x.descrizione || '', csvNum(x.importo), +x.buoni || '', +x.buoni ? csvNum(x.buoniValore) : '', csvNum(cassa(x)), METODI[x.metodo] || '', x.periodo || '', x.note || ''])]);
 }
 const actionsExport = {
   exportJson: () => offerFile(`spese-backup-${isoToday()}.json`, JSON.stringify(S, null, 1), 'application/json'),
@@ -1324,6 +1470,15 @@ function seed() {
       for (let i = 0; i < n; i++) S.movimenti.push({id: uid(), tipo: 'extra', data: `${k}-${pad(1 + Math.floor(rnd() * last))}`, importo: Math.round((a + rnd() * (b - a)) * 100) / 100, categoriaId: C(cn), descrizione: desc, metodo: rnd() < .8 ? 'carta' : 'contanti', note: ''});
     });
   }
+  // buoni pasto: 20 al mese da 6,20 €, usati per parte della spesa
+  S.buoni = {taglio: 6.2, ricariche: []};
+  for (let off = 5; off >= 0; off--) { const {y, m} = addMonths(t.y, t.m, -off); S.buoni.ricariche.push({id: uid(), numero: 20, taglio: 6.2, data: `${ymKey(y, m)}-01`, note: ''}); }
+  const usoMese = {};
+  S.movimenti.filter(x => x.tipo === 'extra' && cat(x.categoriaId).buoni).sort((a, b) => a.data.localeCompare(b.data)).forEach(x => {
+    const km = x.data.slice(0, 7), gia = usoMese[km] || 0;
+    const k = Math.min(saldoBuoni().n, Math.floor(x.importo / 6.2), 4, 17 - gia);
+    if (k > 0 && rnd() < 0.7) { x.buoni = k; x.buoniValore = valoreBuoni(k); usoMese[km] = gia + k; }
+  });
   // lascia un paio di voci del mese corrente da confermare
   const k0 = ymKey(t.y, t.m);
   const daTogliere = S.movimenti.filter(x => x.tipo === 'prevista' && x.periodo === k0 && !x.auto).slice(-2).map(x => x.id);
@@ -1347,6 +1502,9 @@ const A = {
   editMov: (el, id) => formEditMov(id),
   addEnt: () => formEntrata(), editEnt: (el, id) => formEntrata(id),
   budgets: () => formBudgets(),
+  buoni: () => sheetBuoni(),
+  ricarica: () => formRicarica(),
+  editRicarica: (el, id) => formRicarica(id),
   exportIcs: () => exportIcs(),
   bolletta: (el, id) => { const [pid, per] = id.split('|'); formBolletta(pid, per); },
   icsHelp: () => guidaCalendario(),
