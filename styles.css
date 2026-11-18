@@ -280,3 +280,14 @@ input[type=time]{width:auto;max-width:140px;background:var(--card);border:1px so
 .buoni-big{font-size:1.9rem;font-weight:780;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
 #fx-sugg-b[hidden]{display:none}
 .hero-buoni b{white-space:nowrap}.hero-buoni span{min-width:0}
+/* v1.5 blocco */
+.lock{position:fixed;inset:0;z-index:100;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:24px calc(24px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) calc(24px + env(safe-area-inset-left))}
+.lock[hidden]{display:none}
+.lock-in{width:100%;max-width:340px;display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center}
+.lock-logo{width:88px;height:88px;border-radius:22px;box-shadow:var(--shadow);margin-bottom:6px}
+.lock-in h2{font-size:1.4rem}
+.lock-btn{width:100%;padding:15px;font-size:1.05rem;display:flex;align-items:center;justify-content:center;gap:8px;margin-top:14px}
+#lock-pin{width:100%;display:flex;flex-direction:row;gap:8px}
+#lock-pin[hidden]{display:none}
+#lock-pin input{flex:1;text-align:center;letter-spacing:.3em;font-size:1.15rem}
+body.is-locked .tabs,body.is-locked .fab,body.is-locked .top{visibility:hidden}

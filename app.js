@@ -235,6 +235,7 @@ const fPrev = {cat:'', prio:'', mode:'card'};
 function readHash() { const v = (location.hash || '').replace('#',''); view = VIEWS.includes(v) ? v : 'mese'; }
 
 function render() {
+  if (locked) { showLock(); return; }
   $('#title').textContent = TITOLI[view];
   const mn = $('#month-nav');
   if (view === 'mese' || view === 'report') {
@@ -686,6 +687,17 @@ function vAltro() {
   </section>
 
   <section>
+    <div class="sec-h"><h2>🔒 Sicurezza</h2></div>
+    <div class="list">
+      <label class="set-row" style="cursor:pointer"><div class="row-main"><div class="row-t">Blocca con impronta digitale</div><div class="row-s">All'apertura l'app chiede impronta o blocco schermo</div></div><input type="checkbox" class="tgl" data-ch="lockOn"${lockOn() ? ' checked' : ''}></label>
+      ${lockOn() ? `<div class="set-row"><div><div class="row-t">Blocca dopo</div><div class="row-s">Tempo con l'app in background</div></div><select data-ch="lockDelay" style="max-width:150px">${[[0, 'Subito'], [1, '1 minuto'], [5, '5 minuti'], [15, '15 minuti'], [60, '1 ora']].map(([v, l]) => `<option value="${v}"${+lockCfg().delay === v ? ' selected' : ''}>${l}</option>`).join('')}</select></div>
+      <div class="set-row tap" data-a="lockPin"><div><div class="row-t">Cambia PIN di riserva</div><div class="row-s">Serve se l'impronta non funziona</div></div><span class="muted">›</span></div>
+      <div class="set-row tap" data-a="lockNow"><div><div class="row-t">Blocca ora</div></div><span class="muted">🔒</span></div>` : ''}
+    </div>
+    <div class="hint">Il blocco protegge l'apertura dell'app; i dati non sono cifrati. Il sistema può proporti anche PIN o sequenza del telefono al posto dell'impronta.</div>
+  </section>
+
+  <section>
     <div class="sec-h"><h2>Impostazioni</h2></div>
     <div class="list">
       <div class="set-row"><div><div class="row-t">Budget spese extra</div><div class="row-s">Tetto mensile per le spese non previste</div></div><input type="text" inputmode="decimal" data-ch="budget" value="${numIn(S.imp.budgetExtra || '')}" placeholder="0,00"></div>
@@ -740,7 +752,7 @@ function vAltro() {
       <div class="set-row tap" data-a="seed"><div><div class="row-t">Carica dati di esempio</div><div class="row-s">Sostituisce i dati attuali</div></div><span class="muted">›</span></div>
       <div class="set-row tap" data-a="reset"><div><div class="row-t" style="color:var(--danger)">Cancella tutti i dati</div><div class="row-s">Operazione non reversibile</div></div><span class="muted">›</span></div>
     </div>
-    <div class="hint" style="text-align:center">Spese di Casa · v1.4 · ${S.previste.length} previste · ${S.movimenti.length} movimenti</div>
+    <div class="hint" style="text-align:center">Spese di Casa · v1.5 · ${S.previste.length} previste · ${S.movimenti.length} movimenti</div>
   </section>`;
 }
 
@@ -1361,6 +1373,150 @@ function guidaCalendario() {
   </div>`);
 }
 
+// ───────────────────────── Blocco con impronta (v1.5) ─────────────────────────
+// Usa una passkey del telefono (WebAuthn) solo come "porta": i dati non sono cifrati.
+const b64u = {
+  enc: buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''),
+  dec: str => { let t = str.replace(/-/g, '+').replace(/_/g, '/'); while (t.length % 4) t += '='; return Uint8Array.from(atob(t), c => c.charCodeAt(0)); }
+};
+const rndBytes = n => crypto.getRandomValues(new Uint8Array(n));
+const lockCfg = () => S.imp.lock || {};
+const lockOn = () => !!(lockCfg().on && lockCfg().credId);
+let locked = false, hiddenAt = 0, unlocking = false, inPrompt = false, pinTries = 0, pinWait = 0;
+async function bioDisponibile() {
+  try { return !!(window.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()); } catch (e) { return false; }
+}
+async function hashPin(pin, salt) { return b64u.enc(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + ':' + pin))); }
+async function verificaImpronta() {
+  inPrompt = true;
+  try {
+    const cred = await navigator.credentials.get({publicKey: {challenge: rndBytes(32), allowCredentials: [{type: 'public-key', id: b64u.dec(lockCfg().credId)}], userVerification: 'required', timeout: 60000}});
+    const ad = new Uint8Array(cred.response.authenticatorData);
+    if (!(ad[32] & 0x04)) throw new Error('verifica utente mancante');
+    return true;
+  } finally { setTimeout(() => { inPrompt = false; }, 800); }
+}
+async function registraImpronta() {
+  inPrompt = true;
+  try {
+    const cred = await navigator.credentials.create({publicKey: {
+      challenge: rndBytes(32), rp: {name: 'Spese di Casa'},
+      user: {id: rndBytes(16), name: 'Spese di Casa', displayName: 'Spese di Casa'},
+      pubKeyCredParams: [{type: 'public-key', alg: -7}, {type: 'public-key', alg: -257}],
+      authenticatorSelection: {authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'preferred'},
+      timeout: 60000, attestation: 'none'
+    }});
+    return b64u.enc(cred.rawId);
+  } finally { setTimeout(() => { inPrompt = false; }, 800); }
+}
+function lockEl() {
+  let L = $('#lock');
+  if (!L) { L = document.createElement('div'); L.id = 'lock'; L.className = 'lock'; L.hidden = true; document.body.appendChild(L); }
+  return L;
+}
+function lock() {
+  if (!lockOn() || locked) return;
+  locked = true;
+  if (sheetOpen) closeSheet();
+  showLock();
+}
+function showLock() {
+  document.body.classList.add('is-locked');
+  $('#main').innerHTML = ''; $('#month-nav').innerHTML = '';
+  const L = lockEl();
+  if (!L.hidden) return;
+  L.hidden = false;
+  L.innerHTML = `<div class="lock-in">
+    <img src="icons/icon-192.png" alt="" class="lock-logo">
+    <h2>Spese di Casa</h2>
+    <p class="muted" style="margin:0">L'app è bloccata</p>
+    <button class="btn lock-btn" id="lock-bio" type="button"><span style="font-size:1.3rem">🔓</span> Sblocca con l'impronta</button>
+    <p class="hint" id="lock-msg" style="min-height:1.2em;margin:0"></p>
+    <button class="link" id="lock-pin-show" type="button">Usa il PIN di riserva</button>
+    <form id="lock-pin" hidden autocomplete="off">
+      <input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" name="pin" placeholder="PIN di riserva" aria-label="PIN di riserva">
+      <button class="btn" type="submit">Sblocca</button>
+    </form>
+  </div>`;
+  $('#lock-bio', L).onclick = () => unlockBio(false);
+  $('#lock-pin-show', L).onclick = () => { const f = $('#lock-pin', L); f.hidden = false; $('#lock-pin-show', L).hidden = true; f.pin.focus(); };
+  $('#lock-pin', L).onsubmit = async e => {
+    e.preventDefault();
+    const f = e.target, msg = $('#lock-msg', L);
+    if (Date.now() < pinWait) { msg.textContent = `Troppi tentativi: riprova tra ${Math.ceil((pinWait - Date.now()) / 1000)} secondi.`; return; }
+    if (await hashPin(f.pin.value, lockCfg().pinSalt) === lockCfg().pinHash) return unlocked();
+    f.pin.value = '';
+    if (++pinTries >= 5) { pinWait = Date.now() + 30000; pinTries = 0; msg.textContent = 'PIN errato per 5 volte: attendi 30 secondi.'; }
+    else msg.textContent = `PIN errato (${pinTries}/5).`;
+  };
+}
+async function unlockBio(auto) {
+  if (unlocking || !locked) return;
+  unlocking = true;
+  const msg = $('#lock-msg');
+  try { await verificaImpronta(); unlocked(); }
+  catch (e) { if (msg && !auto) msg.textContent = 'Sblocco non riuscito. Riprova oppure usa il PIN di riserva.'; }
+  finally { unlocking = false; }
+}
+function unlocked() {
+  locked = false; pinTries = 0;
+  document.body.classList.remove('is-locked');
+  const L = lockEl(); L.hidden = true; L.innerHTML = '';
+  autoConferma(); render();
+}
+function pinFields() {
+  return `<div class="grid2">
+    <div class="field"><label for="lk-p1">PIN di riserva</label><input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" id="lk-p1" name="p1" placeholder="4–8 cifre" required></div>
+    <div class="field"><label for="lk-p2">Ripeti PIN</label><input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" id="lk-p2" name="p2" required></div>
+  </div>`;
+}
+const pinValido = f => /^\d{4,8}$/.test(f.p1.value) ? (f.p1.value === f.p2.value ? null : 'I due PIN non coincidono') : 'Il PIN deve avere da 4 a 8 cifre';
+function formAttivaBlocco() {
+  openSheet('Blocco con impronta', `<form id="lk" autocomplete="off">
+    <div class="hint">All'apertura, e dopo un po' di tempo in background, l'app chiederà l'impronta digitale (o il blocco schermo del telefono). Il telefono creerà una <b>passkey "Spese di Casa"</b> nel Gestore delle password di Google: non cancellarla.</div>
+    ${pinFields()}
+    <div class="hint" style="margin-top:-4px">Il PIN di riserva serve se l'impronta non funziona o la passkey viene cancellata. Non usare il PIN del telefono o della banca.</div>
+    <div class="form-actions"><button class="btn" type="submit">Attiva e registra l'impronta</button></div>
+  </form>`, el => {
+    const f = $('#lk', el);
+    f.onsubmit = async e => {
+      e.preventDefault();
+      const err = pinValido(f); if (err) return toast(err);
+      if (!await bioDisponibile()) return toast('Impronta o blocco schermo non disponibili su questo dispositivo');
+      try {
+        const credId = await registraImpronta();
+        const salt = b64u.enc(rndBytes(16));
+        S.imp.lock = {on: true, credId, pinSalt: salt, pinHash: await hashPin(f.p1.value, salt), delay: 1};
+        save(); closeSheet(); render(); toast('🔒 Blocco attivato');
+      } catch (x) {
+        toast(x && x.name === 'NotAllowedError' ? 'Registrazione annullata' : 'Impronta non disponibile qui: usa l\'app installata dal telefono');
+      }
+    };
+  });
+}
+function formDisattivaBlocco() {
+  openSheet('Disattiva il blocco', `<div class="guide"><p>Per disattivare il blocco conferma che sei tu.</p></div>
+    <button class="btn block" id="dk-bio" type="button">🔓 Conferma con l'impronta</button>
+    <form id="dk" autocomplete="off" style="margin-top:16px"><div class="field"><label for="dk-p">Oppure con il PIN di riserva</label><input type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" id="dk-p" name="pin"></div>
+    <button class="btn ghost" type="submit">Conferma con il PIN</button></form>`, el => {
+    const spegni = () => { S.imp.lock = {on: false}; save(); closeSheet(); render(); toast('Blocco disattivato'); };
+    $('#dk-bio', el).onclick = async () => { try { await verificaImpronta(); spegni(); } catch (e) { toast('Verifica non riuscita'); } };
+    $('#dk', el).onsubmit = async e => { e.preventDefault(); if (await hashPin(e.target.pin.value, lockCfg().pinSalt) === lockCfg().pinHash) spegni(); else toast('PIN errato'); };
+  });
+}
+function formCambiaPin() {
+  openSheet('PIN di riserva', `<form id="cp" autocomplete="off">${pinFields()}<div class="form-actions"><button class="btn" type="submit">Salva PIN</button></div></form>`, el => {
+    const f = $('#cp', el);
+    f.onsubmit = async e => {
+      e.preventDefault();
+      const err = pinValido(f); if (err) return toast(err);
+      const salt = b64u.enc(rndBytes(16));
+      S.imp.lock.pinSalt = salt; S.imp.lock.pinHash = await hashPin(f.p1.value, salt);
+      save(); closeSheet(); toast('PIN di riserva aggiornato');
+    };
+  });
+}
+
 // ───────────────────────── Esportazione / importazione ─────────────────────────
 function offerFile(name, text, mime) {
   const blob = new Blob([text], {type: mime});
@@ -1503,6 +1659,8 @@ const A = {
   addEnt: () => formEntrata(), editEnt: (el, id) => formEntrata(id),
   budgets: () => formBudgets(),
   buoni: () => sheetBuoni(),
+  lockPin: () => formCambiaPin(),
+  lockNow: () => lock(),
   ricarica: () => formRicarica(),
   editRicarica: (el, id) => formRicarica(id),
   exportIcs: () => exportIcs(),
@@ -1533,6 +1691,8 @@ document.addEventListener('change', e => {
   if (k === 'fCat') { fPrev.cat = el.value; render(); }
   else if (k === 'fPrio') { fPrev.prio = el.value; render(); }
   else if (k === 'budget') { S.imp.budgetExtra = num(el.value); save(); el.value = numIn(S.imp.budgetExtra || ''); toast('Budget salvato'); }
+  else if (k === 'lockOn') { el.checked = lockOn(); if (lockOn()) formDisattivaBlocco(); else formAttivaBlocco(); }
+  else if (k === 'lockDelay') { S.imp.lock.delay = +el.value; save(); toast('Salvato'); }
   else if (k === 'notifOra') { if (/^\d{2}:\d{2}$/.test(el.value)) { S.imp.notifOra = el.value; save(); render(); toast('Ora salvata: riesporta il calendario'); } }
   else if (k === 'notifQuando') { S.imp.notifQuando = el.value; save(); render(); }
   else if (k === 'notifAuto') { S.imp.notifAuto = el.checked; save(); render(); }
@@ -1546,7 +1706,13 @@ document.addEventListener('change', e => {
 });
 window.addEventListener('hashchange', () => { readHash(); render(); window.scrollTo(0, 0); });
 // al ritorno sull'app (es. il giorno dopo) aggiorna stati e scadenze
-document.addEventListener('visibilitychange', () => { if (!document.hidden && !sheetOpen) { autoConferma(); render(); } });
+document.addEventListener('visibilitychange', () => {
+  if (inPrompt) return;  // la finestra dell'impronta non deve far scattare il blocco
+  if (document.hidden) { hiddenAt = Date.now(); if (lockOn() && !(+lockCfg().delay)) lock(); return; }
+  if (lockOn() && !locked && hiddenAt && Date.now() - hiddenAt >= (+lockCfg().delay || 0) * 60000) lock();
+  if (locked) { unlockBio(true); return; }
+  if (!sheetOpen) { autoConferma(); render(); }
+});
 
 // ───────────────────────── PWA ─────────────────────────
 let installEvt = null;
@@ -1558,6 +1724,6 @@ try { if (navigator.storage && navigator.storage.persist) navigator.storage.pers
 
 try { if (localStorage.getItem(KEY)) save(); } catch (e) {} // salva eventuali migrazioni
 readHash();
-autoConferma();
-render();
+if (lockOn()) { locked = true; render(); unlockBio(true); }
+else { autoConferma(); render(); }
 })();
